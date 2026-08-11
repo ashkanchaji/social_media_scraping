@@ -1,0 +1,21 @@
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Python Cache
+__pycache__/
+*.pyc
+
+# Project Specifics (Data & Databases)
+output/
+market-data/
+reports/
+sentiments/
+tweets/
+yt-transcripts/
+scweet_state.db
+
+# Security & Credentials
+cookies.json
