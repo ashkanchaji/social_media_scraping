@@ -16,6 +16,10 @@ sentiments/
 tweets/
 yt-transcripts/
 scweet_state.db
+twtr-tweets/
+x-tweet-fetcher/
 
 # Security & Credentials
 cookies.json
+yt-urls.txt
+yt-keywords.txt
