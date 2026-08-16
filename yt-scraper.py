@@ -1,18 +1,120 @@
 import os
+import re
+import time
+import random
 import json
+import bisect
+import tempfile
+import threading
 import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from youtube_transcript_api import YouTubeTranscriptApi
-from transformers import pipeline
 import yt_dlp
 
 import dedup_utils
-from pipeline_utils import setup_logging, with_retry, detect_language
+from pipeline_utils import setup_logging, with_retry, RateLimiter, detect_language
+
+# Silence huggingface hub warnings
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 logger = setup_logging("yt-scraper", log_file="yt-scraper.log")
 
 MAX_RESULTS_PER_KEYWORD = 30
 MAX_PAST_DAYS = 30
-LANGUAGE_MIN_CONFIDENCE = 0.70  # safety-net check even after translation
+MAX_VIDEO_DURATION_SECONDS = 1200  # 20 minutes max (skips 24/7 live broadcasts)
+
+FETCH_MAX_WORKERS = 4              # Concurrent audio/metadata workers
+FETCH_MIN_INTERVAL = 1.0           # Seconds between video calls enforced globally
+SEARCH_DELAY_RANGE = (8.0, 14.0)   # Pacing delay between keyword searches
+SEARCH_MAX_RETRIES = 3
+
+LANGUAGE_MIN_CONFIDENCE = 0.70
+
+_fetch_rate_limiter = RateLimiter(FETCH_MIN_INTERVAL)
+
+_whisper_model = None
+_model_lock = threading.Lock()
+
+# Circuit breaker: if the local Whisper backend is broken (e.g. a CUDA-enabled
+# ctranslate2 wheel that still tries to dlopen libcublas even in CPU mode),
+# don't keep burning minutes downloading audio for every video only to fail
+# at transcribe time. After a few consecutive library-load failures, disable
+# Whisper for the rest of the run and fall back to subtitle-only mode.
+_WHISPER_FAILURE_LIMIT = 3
+_whisper_failure_count = 0
+_whisper_disabled = False
+_whisper_state_lock = threading.Lock()
+
+# Substrings that indicate an environment/library problem (not a per-video
+# problem) -- e.g. "Library libcublas.so.12 is not found or cannot be loaded".
+_ENV_FAILURE_MARKERS = ("libcublas", "libcudnn", "cannot be loaded", "cuda")
+
+
+def get_whisper_model():
+    """Lazily loads and caches the faster-whisper model."""
+    global _whisper_model
+    with _model_lock:
+        if _whisper_model is None:
+            try:
+                from faster_whisper import WhisperModel
+                logger.info("Initializing faster-whisper model (base.en)... (this may take a moment on first run)")
+                try:
+                    _whisper_model = WhisperModel("base.en", device="cuda", compute_type="float16")
+                    logger.info("faster-whisper model (base.en) successfully loaded and ready (GPU/CUDA).")
+                except Exception as gpu_err:
+                    logger.warning(
+                        f"Could not initialize Whisper on GPU ({str(gpu_err).splitlines()[0]}). "
+                        "Falling back to CPU (int8)."
+                    )
+                    _whisper_model = WhisperModel("base.en", device="cpu", compute_type="int8")
+                    logger.info("faster-whisper model (base.en) successfully loaded and ready (CPU fallback).")
+            except ImportError:
+                logger.warning("faster-whisper is not installed. Falling back strictly to subtitle scraping.")
+                _whisper_model = False
+    return _whisper_model
+
+
+def _record_whisper_env_failure(error_text: str) -> bool:
+    """Tracks consecutive environment-level Whisper failures (missing CUDA
+    libs, etc). Returns True once the failure limit is hit and Whisper has
+    been disabled for the rest of this run."""
+    global _whisper_failure_count, _whisper_disabled
+    lowered = error_text.lower()
+    if not any(marker in lowered for marker in _ENV_FAILURE_MARKERS):
+        return False
+
+    with _whisper_state_lock:
+        if _whisper_disabled:
+            return True
+        _whisper_failure_count += 1
+        if _whisper_failure_count >= _WHISPER_FAILURE_LIMIT:
+            _whisper_disabled = True
+            logger.error(
+                f"Whisper failed {_whisper_failure_count} times in a row with an "
+                f"environment/library error ('{error_text}'). Disabling audio "
+                "transcription for the rest of this run and falling back to "
+                "subtitle-only mode. Fix: reinstall a CPU-only ctranslate2 build, "
+                "or run `pip install nvidia-cublas-cu12 nvidia-cudnn-cu12 "
+                "--break-system-packages` and point LD_LIBRARY_PATH at the "
+                "installed nvidia/*/lib directories before the next run."
+            )
+            return True
+    return False
+
+
+def load_trusted_channels(filepath: str = "yt-channels.txt") -> list:
+    default_channels = ["Reuters", "Bloomberg", "CNBC", "BBC", "CNN", "Al Jazeera"]
+    if not os.path.exists(filepath):
+        logger.warning(f"'{filepath}' not found. Creating default file.")
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write("\n".join(default_channels))
+        return default_channels
+
+    with open(filepath, "r", encoding="utf-8") as f:
+        channels = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+
+    return channels if channels else default_channels
 
 
 def extract_video_id(video_url: str) -> str:
@@ -25,16 +127,24 @@ def extract_video_id(video_url: str) -> str:
     return video_url.strip()
 
 
-@with_retry(max_attempts=3, base_delay=3.0, exceptions=(Exception,))
+@with_retry(max_attempts=3, base_delay=2.0, exceptions=(Exception,))
 def fetch_video_metadata(video_url: str) -> dict:
-    ydl_opts = {'quiet': True, 'skip_download': True, 'no_warnings': True}
+    ydl_opts = {
+        'quiet': True,
+        'skip_download': True,
+        'no_warnings': True,
+        'socket_timeout': 15,
+        'retries': 3,
+    }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
 
     raw_timestamp = info.get('timestamp')
     if raw_timestamp:
-        upload_datetime = datetime.datetime.fromtimestamp(raw_timestamp, datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+        dt = datetime.datetime.fromtimestamp(raw_timestamp, datetime.timezone.utc)
+        upload_datetime = dt.strftime('%Y-%m-%d %H:%M:%S UTC')
     else:
+        dt = None
         upload_datetime = info.get('upload_date', 'N/A')
 
     return {
@@ -42,255 +152,361 @@ def fetch_video_metadata(video_url: str) -> dict:
         "channel": info.get('uploader', 'N/A'),
         "channel_id": info.get('uploader_id', 'N/A'),
         "upload_datetime": upload_datetime,
+        "created_dt": dt,
+        "duration": info.get('duration') or 0,
+        "is_live": info.get('is_live', False),
         "view_count": info.get('view_count', 0) or 0,
         "like_count": info.get('like_count', 0) or 0,
         "comment_count": info.get('comment_count', 0) or 0
     }
 
 
-def search_youtube_videos(keyword: str, max_results: int = 15) -> list:
+def search_youtube_videos(keyword: str, trusted_channels: list, max_results: int = 15) -> list:
     logger.info(f"Searching live feed for: {keyword}...")
-    trusted_agencies = "(Reuters OR Bloomberg OR CNBC OR BBC OR CNN OR Al Jazeera)"
     today = datetime.datetime.now(datetime.timezone.utc)
     past_date = today - datetime.timedelta(days=MAX_PAST_DAYS)
     date_filter = f"after:{past_date.strftime('%Y-%m-%d')}"
 
-    search_query = f"ytsearch30:{keyword} {trusted_agencies} {date_filter}"
-    ydl_opts = {'quiet': True, 'skip_download': True, 'no_warnings': True, 'extract_flat': True}
+    search_query = f"ytsearch30:{keyword} news {date_filter}"
+    ydl_opts = {
+        'quiet': True,
+        'skip_download': True,
+        'no_warnings': True,
+        'extract_flat': True,
+        'socket_timeout': 15,
+        'retries': 3,
+    }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    entries = []
+    for attempt in range(1, SEARCH_MAX_RETRIES + 1):
         try:
-            info = ydl.extract_info(search_query, download=False)
-            entries = info.get('entries', [])
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(search_query, download=False)
+                entries = info.get('entries', []) or []
+            break
         except Exception as e:
-            logger.warning(f"Error during yt-dlp search for '{keyword}': {str(e).splitlines()[0]}")
-            entries = []
+            wait_time = random.uniform(10.0, 20.0) * attempt
+            if attempt < SEARCH_MAX_RETRIES:
+                logger.warning(f"yt-dlp search failed for '{keyword}' ({e}). Retrying in {wait_time:.1f}s...")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"yt-dlp search exhausted attempts for '{keyword}': {e}")
+                entries = []
+        finally:
+            time.sleep(random.uniform(*SEARCH_DELAY_RANGE))
 
-    allowed_formats = []
-    for i in range(MAX_PAST_DAYS + 1):
-        d = today - datetime.timedelta(days=i)
-        allowed_formats.extend([d.strftime('%Y-%m-%d'), d.strftime('%Y%m%d')])
-
-    valid_videos = []
+    trusted_lower = [c.lower() for c in trusted_channels]
+    valid_entries = []
     for entry in entries:
-        video_url = f"https://www.youtube.com/watch?v={entry.get('id')}"
+        uploader = (entry.get('uploader') or entry.get('channel') or '').lower()
+        title = (entry.get('title') or '').lower()
+        if trusted_channels:
+            if any(tc in uploader or tc in title for tc in trusted_lower):
+                valid_entries.append(entry.get('id'))
+        else:
+            valid_entries.append(entry.get('id'))
+
+    if not valid_entries:
+        valid_entries = [entry.get('id') for entry in entries if entry.get('id')]
+
+    logger.info(f"Found {len(valid_entries[:max_results])} candidate video entries for '{keyword}'.")
+    return valid_entries[:max_results]
+
+
+@with_retry(max_attempts=2, base_delay=3.0, exceptions=(Exception,))
+def _download_audio(video_url: str, video_id: str, out_template: str) -> None:
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'outtmpl': out_template,
+        'quiet': True,
+        'no_warnings': True,
+        'socket_timeout': 25,
+        'retries': 3,
+        'fragment_retries': 3,
+        # Forcing the android client sidesteps YouTube's current
+        # signature/PO-token checks that were causing blanket 403s on the
+        # web client's adaptive audio streams.
+        'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
+        'http_headers': {
+            'User-Agent': 'com.google.android.youtube/19.09.37 (Linux; U; Android 14) gzip'
+        },
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '128',
+        }],
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([video_url])
+
+
+def _transcribe_audio_stream(video_url: str, video_id: str, duration: int = 0) -> str:
+    if duration and duration > MAX_VIDEO_DURATION_SECONDS:
+        logger.info(f"Skipping audio download for {video_id}: duration ({duration}s) exceeds {MAX_VIDEO_DURATION_SECONDS}s cap.")
+        return None
+
+    model = get_whisper_model()
+    if not model or _whisper_disabled:
+        return None
+
+    logger.info(f"Downloading lightweight audio for {video_id}...")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_template = os.path.join(tmpdir, f"{video_id}.%(ext)s")
+
         try:
-            meta = fetch_video_metadata(video_url)
-            upload_str = str(meta.get('upload_datetime', ''))
+            _download_audio(video_url, video_id, out_template)
 
-            if any(allowed in upload_str for allowed in allowed_formats):
-                valid_videos.append({'url': video_url, 'view_count': meta.get('view_count', 0)})
-        except Exception:
-            continue
+            audio_file = os.path.join(tmpdir, f"{video_id}.mp3")
+            if not os.path.exists(audio_file):
+                files = os.listdir(tmpdir)
+                if not files:
+                    return None
+                audio_file = os.path.join(tmpdir, files[0])
 
-    valid_videos.sort(key=lambda x: x['view_count'], reverse=True)
-    final_urls = [v['url'] for v in valid_videos[:max_results]]
-    logger.info(f"Found {len(final_urls)} reliable, high-engagement videos for '{keyword}' from the past {MAX_PAST_DAYS * 24} hours.")
-    return final_urls
+            logger.info(f"Transcribing audio for {video_id} with Whisper...")
+            start_t = time.time()
+            segments, _ = model.transcribe(audio_file, beam_size=2, language="en", task="transcribe")
+            transcript_text = " ".join([seg.text.strip() for seg in segments])
+            elapsed = time.time() - start_t
+            logger.info(f"Finished transcribing {video_id} in {elapsed:.1f}s ({len(transcript_text.split())} words).")
+            return transcript_text if transcript_text.strip() else None
+
+        except Exception as e:
+            err_text = str(e).splitlines()[0] if str(e) else type(e).__name__
+            logger.warning(f"Audio transcription failed for {video_id}: {err_text}")
+            _record_whisper_env_failure(err_text)
+            return None
 
 
-def scrape_youtube_transcript_text(video_url: str) -> str:
-    """
-    Fetches a video's transcript, translated to English if needed.
-
-    Note: this used to accept a native Farsi ('fa') transcript as-is
-    without translating it, on the theory that Iran-related coverage in
-    Farsi was still useful raw signal. But everything downstream (FinBERT)
-    is English-only -- a raw Farsi transcript doesn't get scored
-    meaningfully, it just silently produces garbage sentiment. Now ANY
-    non-English transcript goes through translation, same as before for
-    every other language; only native English is used directly.
-    """
+def extract_video_text(video_url: str, duration: int = 0) -> str:
     video_id = extract_video_id(video_url)
     ytt_api = YouTubeTranscriptApi()
 
+    # Tier 1: Instant Subtitle API
     try:
         transcript_list = ytt_api.list(video_id)
         try:
             transcript = transcript_list.find_transcript(['en', 'en-US', 'en-GB', 'en-CA'])
             transcript_data = transcript.fetch().to_raw_data()
         except Exception:
-            translatable = None
-            for t in transcript_list:
-                if t.is_translatable:
-                    translatable = t
-                    break
+            translatable = next((t for t in transcript_list if t.is_translatable), None)
             if translatable:
                 transcript_data = translatable.translate('en').fetch().to_raw_data()
             else:
-                logger.info(f"Skipping {video_id}: No translatable transcript available.")
-                return None
+                transcript_data = None
+
+        if transcript_data:
+            return " ".join([item['text'].replace('\n', ' ') for item in transcript_data])
     except Exception as e:
-        logger.info(f"Skipping {video_id}: Transcripts unavailable ({type(e).__name__}).")
-        return None
+        logger.debug(f"Subtitle fetch failed for {video_id}: {str(e).splitlines()[0] if str(e) else type(e).__name__}")
 
-    return " ".join([item['text'].replace('\n', ' ') for item in transcript_data])
+    # Tier 2: Whisper Audio Fallback
+    logger.info(f"Subtitles unavailable for {video_id}. Falling back to audio Whisper transcription...")
+    return _transcribe_audio_stream(video_url, video_id, duration=duration)
 
 
-def search_and_scrape_youtube(keyword: str, lsh, hash_by_id, run_timestamp: str, output_dir: str = "yt-transcripts/"):
+def _process_single_video(video_id: str) -> tuple:
+    _fetch_rate_limiter.wait()
+    video_url = f"https://www.youtube.com/watch?v={video_id}"
+    try:
+        meta = fetch_video_metadata(video_url)
+        if meta.get('is_live'):
+            logger.info(f"Skipping {video_id}: Active live stream.")
+            return video_id, video_url, None, None
+
+        text = extract_video_text(video_url, duration=meta.get('duration', 0))
+        return video_id, video_url, meta, text
+    except Exception as e:
+        logger.warning(f"Failed processing video {video_id}: {e}")
+        return video_id, video_url, None, None
+
+
+def _insert_sorted(records_list: list, timestamps_list: list, record: dict, dt_val: datetime.datetime):
+    sort_key = dt_val.timestamp() if dt_val else 0.0
+    idx = bisect.bisect_right(timestamps_list, sort_key)
+    records_list.insert(idx, record)
+    timestamps_list.insert(idx, sort_key)
+
+
+def search_and_scrape_youtube(keyword: str, trusted_channels: list, lsh, hash_by_id, output_dir: str = "yt-transcripts/"):
     os.makedirs(output_dir, exist_ok=True)
-    found_urls = search_youtube_videos(keyword, max_results=MAX_RESULTS_PER_KEYWORD)
-    if not found_urls:
+    today = datetime.datetime.now(datetime.timezone.utc)
+    cutoff = today - datetime.timedelta(days=MAX_PAST_DAYS)
+
+    safe_keyword = keyword.replace(" ", "_").lower()
+    master_file = os.path.join(output_dir, f"youtube_{safe_keyword}.json")
+
+    existing_records = []
+    existing_ids = set()
+    existing_timestamps = []
+
+    if os.path.exists(master_file):
+        try:
+            with open(master_file, 'r', encoding='utf-8') as f:
+                existing_records = json.load(f)
+                for rec in existing_records:
+                    rec_id = rec.get("record_id")
+                    if rec_id:
+                        existing_ids.add(rec_id)
+                    pub_str = rec.get("time_stamps", {}).get("published_at")
+                    try:
+                        dt_obj = datetime.datetime.strptime(pub_str, "%Y-%m-%d %H:%M:%S UTC")
+                    except Exception:
+                        dt_obj = None
+                    existing_timestamps.append(dt_obj.timestamp() if dt_obj else 0.0)
+        except Exception as e:
+            logger.error(f"Error loading {master_file}: {e}")
+            existing_records, existing_ids, existing_timestamps = [], set(), []
+
+    candidate_ids = search_youtube_videos(keyword, trusted_channels, max_results=MAX_RESULTS_PER_KEYWORD)
+    if not candidate_ids:
+        logger.info(f"No video candidates found for '{keyword}'.")
         return None
 
-    video_data = []
+    # Match on the exact "_{video_id}" suffix rather than a raw substring
+    # check -- a plain `vid in existing_id` could false-positive if the
+    # video ID happens to appear inside another record's channel_id.
+    new_candidate_ids = [
+        vid for vid in candidate_ids
+        if not any(existing_id.endswith(f"_{vid}") for existing_id in existing_ids)
+    ]
+    if not new_candidate_ids:
+        logger.info(f"All discovered videos for '{keyword}' are already scraped.")
+        return master_file
+
+    fetched_results = []
+    with ThreadPoolExecutor(max_workers=FETCH_MAX_WORKERS) as executor:
+        future_to_id = {executor.submit(_process_single_video, vid): vid for vid in new_candidate_ids}
+        for future in as_completed(future_to_id):
+            vid, vurl, meta, text = future.result()
+            if meta and text:
+                fetched_results.append((vid, vurl, meta, text))
+
+    added_count = 0
     skipped_non_english = 0
 
-    for url in found_urls:
-        video_id = extract_video_id(url)
-        full_text = scrape_youtube_transcript_text(url)
-        if not full_text or not full_text.strip():
+    for vid, vurl, meta, text in fetched_results:
+        clean_text = text.replace("\n", " ").strip()
+        if not clean_text:
             continue
 
-        # Safety net: even after attempted translation, verify the result
-        # is actually English before it reaches FinBERT.
-        lang, confidence = detect_language(full_text)
+        created_dt = meta.get("created_dt")
+        if created_dt is not None and created_dt < cutoff:
+            continue
+
+        lang, confidence = detect_language(clean_text)
         if lang != "en" or confidence < LANGUAGE_MIN_CONFIDENCE:
             skipped_non_english += 1
             continue
 
-        try:
-            meta = fetch_video_metadata(url)
-            collected_at = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-            record_id = f"YouTube_{meta.get('channel_id', 'Unknown')}_{video_id}"
+        channel_id = meta.get("channel_id") or "Unknown"
+        channel_name = meta.get("channel") or "Unknown"
+        record_id = f"YouTube_{channel_id}_{vid}"
 
-            duplication_info = dedup_utils.check_and_register(record_id, full_text, lsh, hash_by_id)
-
-            record = {
-                "record_id": record_id,
-                "Source": {
-                    "platform": "YouTube",
-                    "Source_type": "Social_media",
-                    "Source_name": meta.get('channel', 'N/A'),
-                    "Source_id": meta.get('channel_id', 'N/A'),
-                    "url": url,
-                    "author_name": meta.get('channel', 'N/A'),
-                    "author_id": meta.get('channel_id', 'N/A')
-                },
-                "Content": {
-                    "Content_type": "video",
-                    "title": meta.get('title', 'N/A'),
-                    "raw_text": full_text,
-                    "Clean_text": full_text,
-                    "language": lang
-                },
-                "time_stamps": {
-                    "published_at": meta.get('upload_datetime', 'N/A'),
-                    "collected_at": collected_at,
-                    "updated_at": collected_at
-                },
-                "asset_mention": [{
-                    "mentioned_text": None,
-                    "canonical_name": None,
-                    "Symbol": None,
-                    "asset_class": None,
-                    "asset_id": None,
-                    "confidence": None
-                }],
-                "Engagement": {
-                    "Views": meta.get('view_count') or 0,
-                    "likes": meta.get('like_count') or 0,
-                    "Comments": meta.get('comment_count') or 0,
-                    "shares": 0
-                },
-                "media": {
-                    "has_media": True,
-                    "media_type": "video",
-                    "media_url": url
-                },
-                "deduplication": duplication_info
-            }
-            video_data.append(record)
-        except Exception:
+        if record_id in existing_ids:
             continue
+
+        duplication_info = dedup_utils.check_and_register(record_id, clean_text, lsh, hash_by_id)
+        if duplication_info.get("is_duplicate"):
+            continue
+
+        collected_at = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+
+        record = {
+            "record_id": record_id,
+            "Source": {
+                "platform": "YouTube",
+                "Source_type": "Social_media",
+                "Source_name": channel_name,
+                "Source_id": channel_id,
+                "url": vurl,
+                "author_name": channel_name,
+                "author_id": channel_id
+            },
+            "Content": {
+                "Content_type": "video",
+                "title": meta.get("title", "N/A"),
+                "raw_text": clean_text,
+                "Clean_text": "",
+                "language": lang
+            },
+            "time_stamps": {
+                "published_at": meta.get("upload_datetime", "N/A"),
+                "collected_at": collected_at,
+                "updated_at": collected_at
+            },
+            "asset_mention": [{
+                "mentioned_text": None,
+                "canonical_name": None,
+                "Symbol": None,
+                "asset_class": None,
+                "asset_id": None,
+                "confidence": None
+            }],
+            "Engagement": {
+                "Views": meta.get("view_count", 0),
+                "likes": meta.get("like_count", 0),
+                "Comments": meta.get("comment_count", 0),
+                "shares": 0
+            },
+            "media": {
+                "has_media": True,
+                "media_type": "video",
+                "media_url": vurl
+            },
+            "deduplication": duplication_info
+        }
+
+        _insert_sorted(existing_records, existing_timestamps, record, created_dt)
+        existing_ids.add(record_id)
+        added_count += 1
 
     if skipped_non_english:
         logger.info(f"Filtered out {skipped_non_english} non-English video(s) for '{keyword}'.")
 
-    if not video_data:
-        return None
+    if added_count > 0:
+        with open(master_file, 'w', encoding='utf-8') as f:
+            json.dump(existing_records, f, indent=4, ensure_ascii=False)
+        logger.info(f"Appended {added_count} new sorted videos to {master_file} (Total: {len(existing_records)}).")
+    else:
+        logger.info(f"No new unique videos to append for '{keyword}'.")
 
-    safe_keyword = keyword.replace(" ", "_").lower()
-    # Timestamped per-run filename -- see twtr-scraper.py for why this
-    # matters for continuous/day-and-night operation.
-    output_filename = os.path.join(output_dir, f"youtube_{safe_keyword}_{run_timestamp}.json")
-
-    with open(output_filename, 'w', encoding='utf-8') as f:
-        json.dump(video_data, f, indent=4, ensure_ascii=False)
-
-    return output_filename
-
-
-def analyze_youtube_sentiment(json_filename: str, sentiment_analyzer, output_dir: str = "sentiments/youtube/"):
-    os.makedirs(output_dir, exist_ok=True)
-
-    with open(json_filename, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-
-    results = []
-    for row in data:
-        text = str(row['Content']['raw_text'])
-        if not text.strip():
-            continue
-
-        prediction = sentiment_analyzer(text, truncation=True, max_length=512)[0]
-
-        row['Sentiment'] = {
-            "sentiment": prediction['label'].upper(),
-            "confidence": round(prediction['score'], 3)
-        }
-        results.append(row)
-
-    base_filename = os.path.basename(json_filename).replace(".json", "_sentiment.json")
-    output_filename = os.path.join(output_dir, base_filename)
-
-    with open(output_filename, 'w', encoding='utf-8') as f:
-        json.dump(results, f, indent=4, ensure_ascii=False)
+    return master_file
 
 
 def main():
     keyword_file = "yt-keywords.txt"
+    channels_file = "yt-channels.txt"
+
     if not os.path.exists(keyword_file):
         logger.error(f"File '{keyword_file}' not found.")
         return
 
-    with open(keyword_file, 'r') as f:
+    with open(keyword_file, 'r', encoding='utf-8') as f:
         keywords = [line.strip() for line in f if line.strip()]
 
     if not keywords:
-        logger.error("No keywords found in yt-keywords.txt.")
+        logger.error(f"No keywords found in '{keyword_file}'.")
         return
 
-    run_timestamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-    logger.info(f"Starting scraping run {run_timestamp} for videos...")
+    trusted_channels = load_trusted_channels(channels_file)
+    logger.info(f"Loaded {len(trusted_channels)} trusted channels from {channels_file}.")
 
-    lsh, hash_by_id = dedup_utils.load_lsh()  # shared cross-platform dedup index
-    analysis_queue = []
+    # Pre-load Whisper model once at startup
+    get_whisper_model()
+
+    run_timestamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    logger.info(f"Starting scraping run {run_timestamp} for YouTube videos...")
+
+    lsh, hash_by_id = dedup_utils.load_lsh()
 
     for keyword in keywords:
         try:
-            scraped_file = search_and_scrape_youtube(keyword, lsh, hash_by_id, run_timestamp)
-            if scraped_file:
-                analysis_queue.append(scraped_file)
+            search_and_scrape_youtube(keyword, trusted_channels, lsh, hash_by_id)
         except Exception as e:
             logger.error(f"Error executing search/scrape for keyword '{keyword}': {str(e).splitlines()[0]}")
 
-    logger.info("Scraping for all videos is done.")
-
-    if not analysis_queue:
-        logger.info("No new videos to analyze.")
-        return
-
-    logger.info("Starting analyzing scraped data...")
-    sentiment_analyzer = pipeline("sentiment-analysis", model="ProsusAI/finbert")
-
-    for video_file in analysis_queue:
-        try:
-            analyze_youtube_sentiment(video_file, sentiment_analyzer)
-        except Exception as e:
-            logger.error(f"Error analyzing {video_file}: {str(e).splitlines()[0]}")
-
-    logger.info("Analyzing for all videos is done.")
+    logger.info("Scraping for all YouTube keywords is done.")
 
 
 if __name__ == "__main__":

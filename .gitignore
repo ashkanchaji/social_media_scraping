@@ -17,8 +17,11 @@ x-tweet-fetcher/
 cache/
 
 # Security & Credentials
-yt-keywords.txt
 twtr-keywords.txt
+twtr-accounts.txt
 twtr-scraper.log
+yt-keywords.txt
+yt-channels.txt
 yt-scraper.log
+
 dedup-index.db
