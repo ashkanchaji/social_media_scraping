@@ -2,37 +2,40 @@ import os
 import re
 import time
 import random
-import pandas as pd
+import json
 import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from ddgs import DDGS
 from ddgs.exceptions import RatelimitException, TimeoutException
 from transformers import pipeline
 
-# Pacing: neither DDGS nor FxTwitter guarantee immunity from rate limits --
-# bursty automated traffic is what gets flagged, on any free/no-key service.
-# These add small randomized delays between calls instead of firing back-to-back.
-DDGS_DELAY_RANGE = (2.0, 4.0)      # seconds between search queries
-FETCH_DELAY_RANGE = (0.5, 1.5)     # seconds between individual tweet fetches
+import dedup_utils
+from pipeline_utils import setup_logging, with_retry, RateLimiter, detect_language
+
+logger = setup_logging("twtr-scraper", log_file="twtr-scraper.log")
 
 MAX_RESULTS_PER_KEYWORD = 100
 MAX_PAST_DAYS = 30
 
+FETCH_MAX_WORKERS = 6          # concurrent tweet fetches
+FETCH_MIN_INTERVAL = 0.35      # seconds between fetch calls, enforced globally across all workers
+DDGS_DELAY_RANGE = (5.0, 10.0)
+
+# English-only filter: FinBERT (ProsusAI/finbert) is trained on English
+# financial text. Running it on Japanese/Chinese/etc. text doesn't error --
+# it just produces meaningless sentiment scores. Filtering here avoids
+# polluting the dataset with garbage sentiment labels.
+LANGUAGE_MIN_CONFIDENCE = 0.70
+
+_fetch_rate_limiter = RateLimiter(FETCH_MIN_INTERVAL)
+
 try:
     from xtf import Router, NotFound, RateLimited
 except ImportError:
-    print("Error: x-tweet-fetcher is not installed.")
-    print("Run: git clone https://github.com/ythx-101/x-tweet-fetcher && cd x-tweet-fetcher && pip install .")
+    logger.error("x-tweet-fetcher is not installed.")
     exit(1)
 
-# -----------------------------------------------------------------------------
-# Discovery uses ddgs.
-# The FETCH step below genuinely uses x-tweet-fetcher's own code:
-# Router.fetch_tweet() is zero-dependency (fxtwitter backend)
-# -----------------------------------------------------------------------------
-
-TWEET_URL_RE = re.compile(
-    r"https?://(?:www\.)?(?:x|twitter)\.com/([A-Za-z0-9_]+)/status/(\d+)"
-)
+TWEET_URL_RE = re.compile(r"https?://(?:www\.)?(?:x|twitter)\.com/([A-Za-z0-9_]+)/status/(\d+)")
 
 
 def extract_tweet_ref(url: str):
@@ -43,9 +46,7 @@ def extract_tweet_ref(url: str):
 
 
 def discover_tweet_urls(keyword: str, max_results: int = 15) -> list:
-    """Discovers candidate tweet URLs via DuckDuckGo (free, no key, no login)."""
-    print(f"  -> Searching for: {keyword}...")
-
+    logger.info(f"Searching for: {keyword}...")
     trusted_accounts = ["Reuters", "business", "CNBC", "BBCWorld", "CNN", "AJEnglish"]
     account_filter = " OR ".join(f"from:{a}" for a in trusted_accounts)
     query = f"site:x.com {keyword} ({account_filter})"
@@ -53,22 +54,17 @@ def discover_tweet_urls(keyword: str, max_results: int = 15) -> list:
     found_urls = set()
     try:
         with DDGS() as ddgs:
-            results = ddgs.text(
-                query, region="us-en", safesearch="off",
-                timelimit="w", max_results=max_results * 3,
-            )
+            results = ddgs.text(query, region="us-en", safesearch="off", timelimit="w", max_results=max_results * 3)
     except RatelimitException:
-        print("     -> DDGS rate-limited. Skipping this keyword for this run "
-              "(consider spacing runs further apart, or lowering DDGS_DELAY_RANGE frequency).")
+        logger.warning(f"DDGS rate-limited on '{keyword}'. Skipping this keyword for this run.")
         results = []
     except TimeoutException:
-        print("     -> DDGS timed out, skipping this keyword for this run.")
+        logger.warning(f"DDGS timed out on '{keyword}'. Skipping this keyword for this run.")
         results = []
     except Exception as e:
-        print(f"     Error during DDGS search: {str(e).splitlines()[0]}")
+        logger.warning(f"DDGS error on '{keyword}': {str(e).splitlines()[0]}")
         results = []
     finally:
-        # Pace ourselves before the *next* keyword's search, regardless of outcome.
         time.sleep(random.uniform(*DDGS_DELAY_RANGE))
 
     for r in results:
@@ -77,177 +73,229 @@ def discover_tweet_urls(keyword: str, max_results: int = 15) -> list:
             found_urls.add((ref[0], ref[1]))
 
     final_refs = list(found_urls)[:max_results]
-    print(f"  -> Found {len(final_refs)} candidate posts.")
+    logger.info(f"Found {len(final_refs)} candidate posts for '{keyword}'.")
     return final_refs
 
 
-def search_and_scrape_tweets(keyword: str, router: "Router", output_dir: str = "twtr-tweets/"):
+@with_retry(max_attempts=3, base_delay=3.0, exceptions=(RateLimited, ConnectionError, TimeoutError))
+def _fetch_tweet_safe(username: str, tweet_id: str) -> dict:
     """
-    Discovers (username, tweet_id) pairs via ddgs, then fetches each via
-    xtf's Router.fetch_tweet() -- the repo's own zero-dependency fxtwitter backend.
+    Fetches one tweet. Instantiates its own Router rather than sharing one
+    across threads -- x-tweet-fetcher's docs don't say whether Router
+    holds thread-unsafe internal state (session/backend fallback tracking),
+    so a fresh instance per call sidesteps the question entirely at low
+    cost (Router() construction is just config, not a network call).
+    _fetch_rate_limiter enforces the actual pacing globally across all
+    worker threads so concurrency doesn't turn into a burst.
     """
-    os.makedirs(output_dir, exist_ok=True)
+    _fetch_rate_limiter.wait()
+    router = Router()
+    return router.fetch_tweet(username, tweet_id)
 
+
+def _parse_created_at(created_raw):
+    if not created_raw:
+        return None, created_raw or "N/A"
+    for fmt in ("%a %b %d %H:%M:%S %z %Y", "%Y-%m-%d %H:%M:%S%z", "%Y-%m-%dT%H:%M:%S%z"):
+        try:
+            dt = datetime.datetime.strptime(created_raw, fmt)
+            return dt, dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+        except (ValueError, TypeError):
+            continue
+    return None, created_raw
+
+
+def search_and_scrape_tweets(keyword: str, lsh, hash_by_id, run_timestamp: str, output_dir: str = "twtr-tweets/"):
+    os.makedirs(output_dir, exist_ok=True)
     today = datetime.datetime.now(datetime.timezone.utc)
     cutoff = today - datetime.timedelta(days=MAX_PAST_DAYS)
 
     refs = discover_tweet_urls(keyword, max_results=MAX_RESULTS_PER_KEYWORD)
     if not refs:
-        print(f"     -> No candidate posts found for '{keyword}'.")
+        logger.info(f"No candidate posts found for '{keyword}'.")
         return None
 
+    # --- Concurrent fetch stage (I/O-bound, benefits from threads despite the GIL) ---
+    fetched = []
+    with ThreadPoolExecutor(max_workers=FETCH_MAX_WORKERS) as executor:
+        future_to_ref = {executor.submit(_fetch_tweet_safe, u, tid): (u, tid) for u, tid in refs}
+        for future in as_completed(future_to_ref):
+            username, tweet_id = future_to_ref[future]
+            try:
+                tw = future.result()
+            except NotFound:
+                continue
+            except Exception as e:
+                logger.warning(f"Giving up on tweet {tweet_id} after retries: {type(e).__name__}: {e}")
+                continue
+            if tw:
+                fetched.append((username, tweet_id, tw))
+
+    # --- Sequential processing stage (language filter, dedup DB writes) ---
     tweet_data = []
-    for username, tweet_id in refs:
-        time.sleep(random.uniform(*FETCH_DELAY_RANGE))  # pace individual fetches
+    skipped_non_english = 0
 
-        try:
-            tw = router.fetch_tweet(username, tweet_id)
-        except NotFound:
-            continue
-        except RateLimited:
-            print(f"     -> Rate limited fetching {tweet_id}. Backing off 30s and skipping it for this run.")
-            time.sleep(30)
-            continue
-        except Exception as e:
-            print(f"     -> Skipping {tweet_id}: {type(e).__name__}: {str(e).splitlines()[0]}")
-            continue
-
-        if not tw:
-            continue
-
+    for username, tweet_id, tw in fetched:
         text = tw.get("text") or tw.get("full_text") or ""
         if not text.strip():
             continue
 
-        created_raw = tw.get("created_at") or tw.get("timestamp")
-        created_dt = None
-        created_str = created_raw or "N/A"
-        if created_raw:
-            for fmt in ("%a %b %d %H:%M:%S %z %Y", "%Y-%m-%d %H:%M:%S%z", "%Y-%m-%dT%H:%M:%S%z"):
-                try:
-                    created_dt = datetime.datetime.strptime(created_raw, fmt)
-                    created_str = created_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
-                    break
-                except (ValueError, TypeError):
-                    continue
-
+        created_dt, created_str = _parse_created_at(tw.get("created_at") or tw.get("timestamp"))
         if created_dt is not None and created_dt < cutoff:
             continue
 
-        author_field = tw.get("author")
-        if isinstance(author_field, dict):
-            author_val = author_field.get("screen_name", username)
-        else:
-            author_val = author_field or username
+        clean_text = text.replace("\n", " ")
 
-        tweet_data.append({
-            "tweet_id": tw.get("id") or tw.get("tweet_id") or tweet_id,
-            "text": text.replace("\n", " "),
-            "timestamp": created_str,
-            "author": author_val,
-            "likes": tw.get("likes") or tw.get("like_count") or 0,
-            "retweets": tw.get("retweets") or tw.get("retweet_count") or 0,
-            "reply_count": tw.get("replies") or tw.get("reply_count") or 0,
-            "views": tw.get("views") or tw.get("view_count") or 0,
-        })
+        lang, confidence = detect_language(clean_text)
+        if lang != "en" or confidence < LANGUAGE_MIN_CONFIDENCE:
+            skipped_non_english += 1
+            continue
+
+        author_field = tw.get("author")
+        author_val = author_field.get("screen_name", username) if isinstance(author_field, dict) else (author_field or username)
+
+        collected_at = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+        record_id = f"X_{author_val}_{tweet_id}"
+
+        duplication_info = dedup_utils.check_and_register(record_id, clean_text, lsh, hash_by_id)
+
+        record = {
+            "record_id": record_id,
+            "Source": {
+                "platform": "X",
+                "Source_type": "Social_media",
+                "Source_name": author_val,
+                "Source_id": author_val,
+                "url": f"https://x.com/{author_val}/status/{tweet_id}",
+                "author_name": author_val,
+                "author_id": author_val
+            },
+            "Content": {
+                "Content_type": "tweet",
+                "title": "N/A",
+                "raw_text": clean_text,
+                "Clean_text": clean_text,
+                "language": lang
+            },
+            "time_stamps": {
+                "published_at": created_str,
+                "collected_at": collected_at,
+                "updated_at": collected_at
+            },
+            "asset_mention": [{
+                "mentioned_text": None,
+                "canonical_name": None,
+                "Symbol": None,
+                "asset_class": None,
+                "asset_id": None,
+                "confidence": None
+            }],
+            "Engagement": {
+                "Views": tw.get("views") or tw.get("view_count") or 0,
+                "likes": tw.get("likes") or tw.get("like_count") or 0,
+                "Comments": tw.get("replies") or tw.get("reply_count") or 0,
+                "shares": tw.get("retweets") or tw.get("retweet_count") or 0
+            },
+            "media": {
+                "has_media": False,
+                "media_type": None,
+                "media_url": None
+            },
+            "deduplication": duplication_info
+        }
+        tweet_data.append(record)
+
+    if skipped_non_english:
+        logger.info(f"Filtered out {skipped_non_english} non-English post(s) for '{keyword}'.")
 
     if not tweet_data:
-        print(f"     -> No recent, fetchable tweets found for '{keyword}'.")
+        logger.info(f"No recent, fetchable, English-language tweets found for '{keyword}'.")
         return None
 
-    df = pd.DataFrame(tweet_data)
     safe_keyword = keyword.replace(" ", "_").lower()
-    output_filename = os.path.join(output_dir, f"twitter_{safe_keyword}.csv")
-    df.to_csv(output_filename, index=False)
+    # Timestamped per-run filename (not one-file-per-keyword-forever): this
+    # matters for continuous/day-and-night operation, since a fixed
+    # keyword->filename mapping means the search for that keyword would
+    # only ever run ONCE -- the old code checked "does this file already
+    # exist?" and skipped scraping entirely on every later run, forever.
+    output_filename = os.path.join(output_dir, f"twitter_{safe_keyword}_{run_timestamp}.json")
 
-    print(f"  -> Found {len(tweet_data)} reliable, high-engagement tweets from the past {MAX_PAST_DAYS * 24} hours.")
+    with open(output_filename, 'w', encoding='utf-8') as f:
+        json.dump(tweet_data, f, indent=4, ensure_ascii=False)
+
+    logger.info(f"Found {len(tweet_data)} reliable, English-language tweets for '{keyword}' from the past {MAX_PAST_DAYS * 24} hours.")
     return output_filename
 
 
-def analyze_tweet_sentiment(csv_filename: str, search_keyword: str, sentiment_analyzer, output_dir: str = "sentiments/twitter/"):
+def analyze_tweet_sentiment(json_filename: str, sentiment_analyzer, output_dir: str = "sentiments/twitter/"):
     os.makedirs(output_dir, exist_ok=True)
-    df = pd.read_csv(csv_filename)
+
+    with open(json_filename, 'r', encoding='utf-8') as f:
+        data = json.load(f)
 
     results = []
-    for idx, row in df.iterrows():
-        text = str(row['text'])
+    for row in data:
+        text = str(row['Content']['raw_text'])
         if not text.strip():
             continue
 
         prediction = sentiment_analyzer(text, truncation=True, max_length=512)[0]
 
-        results.append({
-            "tweet_id": row['tweet_id'],
-            "text": text, # Replaced text_snippet to keep the full unmodified text
+        row['Sentiment'] = {
             "sentiment": prediction['label'].upper(),
-            "confidence": round(prediction['score'], 3),
-            "search_keyword": search_keyword,
-            "author": row['author'],
-            "timestamp": row['timestamp'],
-            "likes": row['likes'],
-            "retweets": row['retweets'],
-            "reply_count": row.get('reply_count', 0),
-            "views": row.get('views', 0)
-        })
+            "confidence": round(prediction['score'], 3)
+        }
+        results.append(row)
 
-    results_df = pd.DataFrame(results)
-    base_filename = os.path.basename(csv_filename).replace(".csv", "_sentiment.csv")
+    base_filename = os.path.basename(json_filename).replace(".json", "_sentiment.json")
     output_filename = os.path.join(output_dir, base_filename)
-    results_df.to_csv(output_filename, index=False)
+
+    with open(output_filename, 'w', encoding='utf-8') as f:
+        json.dump(results, f, indent=4, ensure_ascii=False)
 
 
 def main():
     keyword_file = "twtr-keywords.txt"
-
     if not os.path.exists(keyword_file):
-        print(f"File '{keyword_file}' not found.")
+        logger.error(f"File '{keyword_file}' not found.")
         return
 
     with open(keyword_file, 'r') as f:
         keywords = [line.strip() for line in f if line.strip()]
 
     if not keywords:
-        print(f"No keywords found in {keyword_file}.")
+        logger.error(f"No keywords found in {keyword_file}.")
         return
 
-    print("Starting scraping for X (Twitter)...")
-    router = Router()  # backend="auto"; fetch_tweet resolves to fxtwitter regardless
+    run_timestamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    logger.info(f"Starting scraping run {run_timestamp} for X (Twitter)...")
+
+    lsh, hash_by_id = dedup_utils.load_lsh()  # shared cross-platform dedup index
     analysis_queue = []
 
     for keyword in keywords:
         try:
-            safe_keyword = keyword.replace(" ", "_").lower()
-            tweet_file = os.path.join("twtr-tweets", f"twitter_{safe_keyword}.csv")
-            sentiment_file = os.path.join("sentiments/twitter", f"twitter_{safe_keyword}_sentiment.csv")
-
-            if os.path.exists(sentiment_file):
-                continue
-
-            if not os.path.exists(tweet_file):
-                scraped_file = search_and_scrape_tweets(keyword, router)
-                if not scraped_file:
-                    continue
-
-            analysis_queue.append((tweet_file, keyword))
+            scraped_file = search_and_scrape_tweets(keyword, lsh, hash_by_id, run_timestamp)
+            if scraped_file:
+                analysis_queue.append(scraped_file)
         except Exception as e:
-            print(f"     Error executing search/scrape for keyword '{keyword}': {str(e).splitlines()[0]}")
+            logger.error(f"Error executing search/scrape for keyword '{keyword}': {str(e).splitlines()[0]}")
 
-    print("Scraping for all keywords is done.")
-
+    logger.info("Scraping for all keywords is done.")
     if not analysis_queue:
-        print("No new tweets to analyze.")
+        logger.info("No new tweets to analyze.")
         return
 
-    print("Starting analyzing scraped tweet data...")
+    logger.info("Starting analyzing scraped tweet data...")
     sentiment_analyzer = pipeline("sentiment-analysis", model="ProsusAI/finbert")
 
-    for tweet_file, keyword in analysis_queue:
+    for tweet_file in analysis_queue:
         try:
-            analyze_tweet_sentiment(tweet_file, keyword, sentiment_analyzer)
+            analyze_tweet_sentiment(tweet_file, sentiment_analyzer)
         except Exception as e:
-            print(f"Error analyzing {tweet_file}: {str(e).splitlines()[0]}")
+            logger.error(f"Error analyzing {tweet_file}: {str(e).splitlines()[0]}")
 
-    print("Analyzing for all tweets is done.")
+    logger.info("Analyzing for all tweets is done.")
 
 
 if __name__ == "__main__":
