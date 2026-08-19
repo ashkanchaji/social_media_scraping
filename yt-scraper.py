@@ -12,7 +12,14 @@ from youtube_transcript_api import YouTubeTranscriptApi
 import yt_dlp
 
 import dedup_utils
-from pipeline_utils import setup_logging, with_retry, RateLimiter, detect_language
+from pipeline_utils import (
+    setup_logging,
+    with_retry,
+    RateLimiter,
+    detect_language,
+    extract_asset_mentions,
+    build_quality,
+)
 
 # Silence huggingface hub warnings
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -23,6 +30,16 @@ logger = setup_logging("yt-scraper", log_file="yt-scraper.log")
 MAX_RESULTS_PER_KEYWORD = 30
 MAX_PAST_DAYS = 30
 MAX_VIDEO_DURATION_SECONDS = 1200  # 20 minutes max (skips 24/7 live broadcasts)
+
+# "base.en" is English-only and will hallucinate fluent-sounding but
+# meaningless English text when given non-English audio (it has no notion
+# of any other language, so it just pattern-matches sounds to English
+# words). Using a multilingual model + task="translate" (below) instead
+# lets Whisper auto-detect the spoken language and translate it to English
+# properly, matching the quality of YouTube's own auto-translate captions.
+# "small" is a reasonable speed/quality balance for an RTX 3070; bump to
+# "medium" if translation quality on non-English sources still looks weak.
+WHISPER_MODEL_SIZE = "small"
 
 FETCH_MAX_WORKERS = 4              # Concurrent audio/metadata workers
 FETCH_MIN_INTERVAL = 1.0           # Seconds between video calls enforced globally
@@ -58,17 +75,17 @@ def get_whisper_model():
         if _whisper_model is None:
             try:
                 from faster_whisper import WhisperModel
-                logger.info("Initializing faster-whisper model (base.en)... (this may take a moment on first run)")
+                logger.info(f"Initializing faster-whisper model ({WHISPER_MODEL_SIZE})... (this may take a moment on first run)")
                 try:
-                    _whisper_model = WhisperModel("base.en", device="cuda", compute_type="float16")
-                    logger.info("faster-whisper model (base.en) successfully loaded and ready (GPU/CUDA).")
+                    _whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cuda", compute_type="float16")
+                    logger.info(f"faster-whisper model ({WHISPER_MODEL_SIZE}) successfully loaded and ready (GPU/CUDA).")
                 except Exception as gpu_err:
                     logger.warning(
                         f"Could not initialize Whisper on GPU ({str(gpu_err).splitlines()[0]}). "
                         "Falling back to CPU (int8)."
                     )
-                    _whisper_model = WhisperModel("base.en", device="cpu", compute_type="int8")
-                    logger.info("faster-whisper model (base.en) successfully loaded and ready (CPU fallback).")
+                    _whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
+                    logger.info(f"faster-whisper model ({WHISPER_MODEL_SIZE}) successfully loaded and ready (CPU fallback).")
             except ImportError:
                 logger.warning("faster-whisper is not installed. Falling back strictly to subtitle scraping.")
                 _whisper_model = False
@@ -147,11 +164,35 @@ def fetch_video_metadata(video_url: str) -> dict:
         dt = None
         upload_datetime = info.get('upload_date', 'N/A')
 
+    modified_timestamp = info.get('modified_timestamp')
+    if modified_timestamp:
+        try:
+            modified_dt = datetime.datetime.fromtimestamp(modified_timestamp, datetime.timezone.utc)
+            updated_at = modified_dt.strftime('%Y-%m-%d %H:%M:%S UTC')
+        except (ValueError, TypeError, OSError, OverflowError):
+            updated_at = None
+    else:
+        updated_at = None
+
+    # yt-dlp exposes both uploader_id and channel_id. For a stable author
+    # identifier we want YouTube's canonical channel ID (normally UC...).
+    channel_id = info.get('channel_id')
+    if not channel_id:
+        for channel_url in (info.get('channel_url'), info.get('uploader_url')):
+            if not channel_url:
+                continue
+            match = re.search(r"youtube\.com/channel/(UC[A-Za-z0-9_-]{22})", channel_url)
+            if match:
+                channel_id = match.group(1)
+                break
+
     return {
         "title": info.get('title', 'N/A'),
-        "channel": info.get('uploader', 'N/A'),
-        "channel_id": info.get('uploader_id', 'N/A'),
+        "channel": info.get('channel') or info.get('uploader') or 'N/A',
+        "channel_id": channel_id,
+        "channel_handle": info.get('uploader_id'),
         "upload_datetime": upload_datetime,
+        "updated_at": updated_at,
         "created_dt": dt,
         "duration": info.get('duration') or 0,
         "is_live": info.get('is_live', False),
@@ -220,6 +261,7 @@ def _download_audio(video_url: str, video_id: str, out_template: str) -> None:
         'outtmpl': out_template,
         'quiet': True,
         'no_warnings': True,
+        'noprogress': True,
         'socket_timeout': 25,
         'retries': 3,
         'fragment_retries': 3,
@@ -265,10 +307,18 @@ def _transcribe_audio_stream(video_url: str, video_id: str, duration: int = 0) -
 
             logger.info(f"Transcribing audio for {video_id} with Whisper...")
             start_t = time.time()
-            segments, _ = model.transcribe(audio_file, beam_size=2, language="en", task="transcribe")
+            # task="translate" makes Whisper auto-detect the spoken language
+            # and translate it directly to English, instead of transcribing
+            # verbatim in whatever language is detected. Combined with a
+            # multilingual model (not "*.en"), this is what actually handles
+            # non-English source audio correctly.
+            segments, info = model.transcribe(audio_file, beam_size=2, task="translate")
             transcript_text = " ".join([seg.text.strip() for seg in segments])
             elapsed = time.time() - start_t
-            logger.info(f"Finished transcribing {video_id} in {elapsed:.1f}s ({len(transcript_text.split())} words).")
+            logger.info(
+                f"Finished transcribing {video_id} in {elapsed:.1f}s "
+                f"({len(transcript_text.split())} words, detected source language: {info.language})."
+            )
             return transcript_text if transcript_text.strip() else None
 
         except Exception as e:
@@ -399,9 +449,9 @@ def search_and_scrape_youtube(keyword: str, trusted_channels: list, lsh, hash_by
             skipped_non_english += 1
             continue
 
-        channel_id = meta.get("channel_id") or "Unknown"
+        channel_id = meta.get("channel_id")
         channel_name = meta.get("channel") or "Unknown"
-        record_id = f"YouTube_{channel_id}_{vid}"
+        record_id = f"YouTube_{channel_id or 'unknown'}_{vid}"
 
         if record_id in existing_ids:
             continue
@@ -412,13 +462,15 @@ def search_and_scrape_youtube(keyword: str, trusted_channels: list, lsh, hash_by
 
         collected_at = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
 
+        asset_evidence_text = (str(meta.get("title") or "") + "\n" + clean_text).strip()
+
         record = {
             "record_id": record_id,
             "Source": {
                 "platform": "YouTube",
                 "Source_type": "Social_media",
                 "Source_name": channel_name,
-                "Source_id": channel_id,
+                "Source_id": vid,
                 "url": vurl,
                 "author_name": channel_name,
                 "author_id": channel_id
@@ -433,16 +485,9 @@ def search_and_scrape_youtube(keyword: str, trusted_channels: list, lsh, hash_by
             "time_stamps": {
                 "published_at": meta.get("upload_datetime", "N/A"),
                 "collected_at": collected_at,
-                "updated_at": collected_at
+                "updated_at": meta.get("updated_at")
             },
-            "asset_mention": [{
-                "mentioned_text": None,
-                "canonical_name": None,
-                "Symbol": None,
-                "asset_class": None,
-                "asset_id": None,
-                "confidence": None
-            }],
+            "asset_mention": extract_asset_mentions(asset_evidence_text, context_terms=[keyword]),
             "Engagement": {
                 "Views": meta.get("view_count", 0),
                 "likes": meta.get("like_count", 0),
@@ -456,6 +501,7 @@ def search_and_scrape_youtube(keyword: str, trusted_channels: list, lsh, hash_by
             },
             "deduplication": duplication_info
         }
+        record["quality"] = build_quality(record, complete_raw_text=True, extraction_errors=[])
 
         _insert_sorted(existing_records, existing_timestamps, record, created_dt)
         existing_ids.add(record_id)

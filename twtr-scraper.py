@@ -10,7 +10,14 @@ from ddgs import DDGS
 from ddgs.exceptions import RatelimitException, TimeoutException
 
 import dedup_utils
-from pipeline_utils import setup_logging, with_retry, RateLimiter, detect_language
+from pipeline_utils import (
+    setup_logging,
+    with_retry,
+    RateLimiter,
+    detect_language,
+    extract_asset_mentions,
+    build_quality,
+)
 
 logger = setup_logging("twtr-scraper", log_file="twtr-scraper.log")
 
@@ -185,13 +192,163 @@ def _fetch_tweet_safe(username: str, tweet_id: str) -> dict:
 def _parse_created_at(created_raw):
     if not created_raw:
         return None, created_raw or "N/A"
-    for fmt in ("%a %b %d %H:%M:%S %z %Y", "%Y-%m-%d %H:%M:%S%z", "%Y-%m-%dT%H:%M:%S%z"):
+    if isinstance(created_raw, datetime.datetime):
+        dt = created_raw
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        else:
+            dt = dt.astimezone(datetime.timezone.utc)
+        return dt, dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    if isinstance(created_raw, (int, float)):
+        try:
+            # Accept both Unix seconds and Unix milliseconds.
+            value = created_raw / 1000 if created_raw > 10_000_000_000 else created_raw
+            dt = datetime.datetime.fromtimestamp(value, datetime.timezone.utc)
+            return dt, dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+        except (ValueError, OSError, OverflowError):
+            return None, str(created_raw)
+
+    for fmt in (
+        "%a %b %d %H:%M:%S %z %Y",
+        "%Y-%m-%d %H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%d %H:%M:%S UTC",
+    ):
         try:
             dt = datetime.datetime.strptime(created_raw, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
             return dt, dt.strftime("%Y-%m-%d %H:%M:%S UTC")
         except (ValueError, TypeError):
             continue
     return None, created_raw
+
+
+def _nested_get(data, *path):
+    current = data
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _extract_tweet_text(tw: dict) -> tuple:
+    """Return (text, is_complete, extraction_errors, extraction_reliability).
+
+    We only mark a tweet as truncated when the fetched object gives explicit
+    truncation evidence *and* no full-text representation is available. Tweet
+    length, a trailing ellipsis, and display_text_range are not truncation
+    evidence by themselves: all three can occur in perfectly complete posts.
+    """
+    candidates = [
+        ("note_tweet_result", _nested_get(tw, "note_tweet", "note_tweet_results", "result", "text")),
+        ("note_tweet", _nested_get(tw, "note_tweet", "text")),
+        ("note_tweet_text", tw.get("note_tweet_text")),
+        ("extended_tweet", _nested_get(tw, "extended_tweet", "full_text")),
+        ("full_text", tw.get("full_text")),
+        ("retweeted_full_text", _nested_get(tw, "retweeted_status", "full_text")),
+        ("text", tw.get("text")),
+    ]
+    selected_source, text = next(
+        ((name, value) for name, value in candidates if isinstance(value, str) and value.strip()),
+        (None, ""),
+    )
+    stripped = text.strip()
+    if not stripped:
+        return "", False, ["Tweet text is empty"], 0.0
+
+    explicit_truncated = bool(tw.get("truncated") or tw.get("is_truncated"))
+    selected_is_full = selected_source not in {None, "text"}
+
+    # x-tweet-fetcher's unified single-tweet schema is intended to return full
+    # tweet content. Therefore a normal text-only result is accepted as complete
+    # unless the backend explicitly says it is truncated. If an explicit flag
+    # exists but we selected one of the full/note fields, the full field wins.
+    is_complete = selected_is_full or not explicit_truncated
+    errors = []
+    reliability = 1.0 if is_complete else None
+
+    if not is_complete:
+        errors.append("Tweet fetch explicitly reports truncated text and no full-text field was available")
+        display_range = tw.get("display_text_range")
+        if (
+            isinstance(display_range, (list, tuple))
+            and len(display_range) >= 2
+            and isinstance(display_range[1], int)
+            and display_range[1] > 0
+        ):
+            # This ratio is used only after explicit truncation was established;
+            # display_text_range alone never triggers truncation.
+            reliability = min(1.0, len(stripped) / display_range[1])
+
+    return text, is_complete, errors, reliability
+
+def _extract_author_identity(tw: dict, fallback_handle: str) -> tuple:
+    """Returns (display_name, handle) with the handle normalized without @."""
+    raw_author = tw.get("author")
+    author = raw_author if isinstance(raw_author, dict) else {}
+    user = tw.get("user") if isinstance(tw.get("user"), dict) else {}
+
+    handle = (
+        author.get("screen_name")
+        or author.get("screenName")
+        or author.get("username")
+        or author.get("handle")
+        or user.get("screen_name")
+        or user.get("screenName")
+        or user.get("username")
+        or user.get("handle")
+        or tw.get("screen_name")
+        or tw.get("screenName")
+        or tw.get("username")
+        or fallback_handle
+    )
+    handle = str(handle or "").strip().lstrip("@")
+    if not re.fullmatch(r"[A-Za-z0-9_]{1,15}", handle):
+        # The URL/discovery handle is usually the most trustworthy fallback.
+        fallback = str(fallback_handle or "").strip().lstrip("@")
+        handle = fallback if re.fullmatch(r"[A-Za-z0-9_]{1,15}", fallback) else handle
+
+    display_name = (
+        author.get("name")
+        or author.get("display_name")
+        or user.get("name")
+        or user.get("display_name")
+        or tw.get("author_name")
+        or tw.get("name")
+        or (raw_author if isinstance(raw_author, str) else None)
+        or handle
+    )
+    return str(display_name or handle), handle
+
+
+def _extract_updated_at(tw: dict):
+    """Returns the latest explicit edit timestamp, otherwise None.
+
+    We intentionally do not copy collection time into updated_at and do not
+    use Twitter's ``editable_until`` metadata, because that is an edit window,
+    not proof that the post was edited.
+    """
+    edit_info = tw.get("edit_info") if isinstance(tw.get("edit_info"), dict) else {}
+    candidates = [
+        tw.get("edited_at"),
+        tw.get("last_edited_at"),
+        tw.get("edit_timestamp"),
+        tw.get("modified_at"),
+        edit_info.get("edited_at"),
+        edit_info.get("last_edited_at"),
+        edit_info.get("timestamp"),
+    ]
+    parsed = []
+    for value in candidates:
+        dt, formatted = _parse_created_at(value)
+        if dt is not None:
+            parsed.append((dt, formatted))
+    if not parsed:
+        return None
+    return max(parsed, key=lambda item: item[0])[1]
 
 
 def _insert_sorted(records_list: list, timestamps_list: list, record: dict, dt_val: datetime.datetime):
@@ -271,7 +428,7 @@ def search_and_scrape_tweets(keyword: str, trusted_accounts: list, lsh, hash_by_
     skipped_non_english = 0
 
     for username, tweet_id, tw in fetched:
-        text = tw.get("text") or tw.get("full_text") or ""
+        text, text_is_complete, extraction_errors, extraction_reliability = _extract_tweet_text(tw)
         if not text.strip():
             continue
 
@@ -286,10 +443,9 @@ def search_and_scrape_tweets(keyword: str, trusted_accounts: list, lsh, hash_by_
             skipped_non_english += 1
             continue
 
-        author_field = tw.get("author")
-        author_val = author_field.get("screen_name", username) if isinstance(author_field, dict) else (author_field or username)
+        author_name, author_id = _extract_author_identity(tw, username)
 
-        record_id = f"X_{author_val}_{tweet_id}"
+        record_id = f"X_{author_id}_{tweet_id}"
         if record_id in existing_ids:
             continue
 
@@ -299,17 +455,18 @@ def search_and_scrape_tweets(keyword: str, trusted_accounts: list, lsh, hash_by_
 
         media_info = _extract_media_info(tw, text)
         collected_at = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+        updated_at = _extract_updated_at(tw)
 
         record = {
             "record_id": record_id,
             "Source": {
                 "platform": "X",
                 "Source_type": "Social_media",
-                "Source_name": author_val,
-                "Source_id": author_val,
-                "url": f"https://x.com/{author_val}/status/{tweet_id}",
-                "author_name": author_val,
-                "author_id": author_val
+                "Source_name": author_name,
+                "Source_id": tweet_id,
+                "url": f"https://x.com/{author_id}/status/{tweet_id}",
+                "author_name": author_name,
+                "author_id": author_id
             },
             "Content": {
                 "Content_type": "tweet",
@@ -321,16 +478,9 @@ def search_and_scrape_tweets(keyword: str, trusted_accounts: list, lsh, hash_by_
             "time_stamps": {
                 "published_at": created_str,
                 "collected_at": collected_at,
-                "updated_at": collected_at
+                "updated_at": updated_at
             },
-            "asset_mention": [{
-                "mentioned_text": None,
-                "canonical_name": None,
-                "Symbol": None,
-                "asset_class": None,
-                "asset_id": None,
-                "confidence": None
-            }],
+            "asset_mention": extract_asset_mentions(clean_text, context_terms=[keyword]),
             "Engagement": {
                 "Views": tw.get("views") or tw.get("view_count") or 0,
                 "likes": tw.get("likes") or tw.get("like_count") or 0,
@@ -340,6 +490,12 @@ def search_and_scrape_tweets(keyword: str, trusted_accounts: list, lsh, hash_by_
             "media": media_info,
             "deduplication": duplication_info
         }
+        record["quality"] = build_quality(
+            record,
+            complete_raw_text=text_is_complete,
+            extraction_errors=extraction_errors,
+            extraction_reliability=extraction_reliability,
+        )
 
         _insert_sorted(existing_records, existing_timestamps, record, created_dt)
         existing_ids.add(record_id)

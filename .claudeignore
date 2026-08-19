@@ -13,7 +13,6 @@ reports/
 sentiments/
 yt-transcripts/
 twtr-tweets/
-tel-transcripts/
 x-tweet-fetcher/
 cache/
 
@@ -24,11 +23,5 @@ twtr-scraper.log
 yt-keywords.txt
 yt-channels.txt
 yt-scraper.log
-tel-channels.txt
-tel-scraper.log
-
-# Telethon login sessions are live account credentials.
-*.session
-*.session-journal
 
 dedup-index.db
