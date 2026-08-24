@@ -18,7 +18,6 @@ yt-scraper.py at the same time, or a future 24/7 daemon.
 Install: pip install datasketch numpy --break-system-packages
 """
 
-import os
 import re
 import json
 import hashlib
@@ -97,11 +96,22 @@ def load_lsh():
 
 
 def check_and_register(record_id: str, text: str, lsh: MinHashLSH, hash_by_id: dict) -> dict:
+    """
+    Registers a record and reports whether its text duplicates an earlier one.
+
+    Safe to call again for a record_id that is already registered (Telegram
+    re-checks a message whenever an edit changes its text). A record is never
+    a duplicate of itself, so its own entry is excluded from both the exact
+    and near-duplicate layers; without that, a re-checked record would match
+    the stale copy of itself still sitting in the index.
+    """
     content_hash = hashlib.md5(_normalize_text(text).encode("utf-8")).hexdigest()
     m = _make_minhash(text)
+    previous = hash_by_id.get(record_id)
 
     exact_match_id = next(
-        (rid for rid, info in hash_by_id.items() if info["content_hash"] == content_hash),
+        (rid for rid, info in hash_by_id.items()
+         if info["content_hash"] == content_hash and rid != record_id),
         None,
     )
 
@@ -114,7 +124,7 @@ def check_and_register(record_id: str, text: str, lsh: MinHashLSH, hash_by_id: d
             "original_record_id": exact_match_id,
         }
     else:
-        near_matches = lsh.query(m)
+        near_matches = [rid for rid in lsh.query(m) if rid != record_id]
         if near_matches:
             original_id = near_matches[0]
             group_id = hash_by_id[original_id]["duplicate_group_id"] or original_id
@@ -132,8 +142,18 @@ def check_and_register(record_id: str, text: str, lsh: MinHashLSH, hash_by_id: d
                 "original_record_id": None,
             }
 
-    # Register only if the key is not already in the index
-    if record_id not in hash_by_id:
+    # Insert on first sight; on a re-check whose text changed, swap the stale
+    # MinHash out so the LSH keeps agreeing with the stored content_hash.
+    if previous is None:
+        try:
+            lsh.insert(record_id, m)
+        except ValueError:
+            pass
+    elif previous["content_hash"] != content_hash:
+        try:
+            lsh.remove(record_id)
+        except ValueError:
+            pass
         try:
             lsh.insert(record_id, m)
         except ValueError:

@@ -1,0 +1,245 @@
+"""
+Runnable self-check for the shared record schema.
+
+Builds one minimal, fully-valid record per supported platform and asserts that
+build_quality scores it 100 with nothing missing, then asserts that each
+platform-specific identity check actually rejects a wrong value. This is the
+smallest thing that fails if a platform is added to one validator but forgotten
+in another (the failure mode the per-platform branches in pipeline_utils are
+most prone to).
+
+It also covers the shared run-configuration layer every scraper now reads its
+constants through (env overrides, discovery-mode selection, keyword matching,
+the append-and-resort output file, and the fa/en analysis routing), since a
+silent regression there changes what every scraper collects.
+
+Run: python selfcheck_schema.py
+"""
+
+import os
+import json
+import tempfile
+
+import pipeline_utils
+from pipeline_utils import build_quality
+
+NO_ASSET = [{
+    "mentioned_text": None, "canonical_name": None, "Symbol": None,
+    "asset_class": None, "asset_id": None, "confidence": None,
+}]
+
+PUBLISHED = "2026-08-20 10:00:00 UTC"
+COLLECTED = "2026-08-20 12:00:00 UTC"
+
+# platform -> (author_id, source_id, url, content_type, media)
+PLATFORMS = {
+    "X": ("Reuters", "1799999999999999999",
+          "https://x.com/Reuters/status/1799999999999999999", "tweet",
+          {"has_media": False, "media_type": None, "media_url": None}),
+    "YouTube": ("UCabcdefghijklmnopqrstuv", "dQw4w9WgXcQ",
+                "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "video",
+                {"has_media": True, "media_type": "video",
+                 "media_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"}),
+    "Telegram": ("reuters", "4242", "https://t.me/reuters/4242", "message",
+                 {"has_media": False, "media_type": None, "media_url": None}),
+    "Reddit": ("worldnews", "1abc2de",
+               "https://www.reddit.com/r/worldnews/comments/1abc2de/some_slug/", "post",
+               {"has_media": True, "media_type": "link",
+                "media_url": "https://example.com/article"}),
+    "TikTok": ("reuters", "7300000000000000001",
+               "https://www.tiktok.com/@reuters/video/7300000000000000001", "video",
+               {"has_media": True, "media_type": "video",
+                "media_url": "https://www.tiktok.com/@reuters/video/7300000000000000001"}),
+    "TruthSocial": ("realDonaldTrump", "109999999999999999",
+                    "https://truthsocial.com/@realDonaldTrump/posts/109999999999999999", "post",
+                    {"has_media": False, "media_type": None, "media_url": None}),
+}
+
+
+def make_record(platform, author_id, source_id, url, content_type, media):
+    record_id = f"{platform}_{author_id}_{source_id}"
+    return {
+        "record_id": record_id,
+        "Source": {
+            "platform": platform,
+            "Source_type": "Social_media",
+            "Source_name": "Example Source",
+            "Source_id": source_id,
+            "url": url,
+            "author_name": "Example Source",
+            "author_id": author_id,
+        },
+        "Content": {
+            "Content_type": content_type,
+            "title": "Example headline",
+            "raw_text": "Oil prices moved on the latest supply report.",
+            "Clean_text": "",
+            "language": "en",
+            "translated_text": None,
+        },
+        "time_stamps": {
+            "published_at": PUBLISHED,
+            "collected_at": COLLECTED,
+            "updated_at": None,
+        },
+        "asset_mention": NO_ASSET,
+        "sentiment": {"label": None, "confidence": None},
+        "Engagement": {"Views": 10, "likes": 2, "Comments": 1, "shares": 0},
+        "media": media,
+        "deduplication": {
+            "content_hash": "0" * 32,
+            "is_duplicate": False,
+            "duplicate_group_id": record_id,
+            "original_record_id": None,
+        },
+    }
+
+
+def check_config_helpers():
+    """The .env-driven config layer: precedence, parsing, and bad-value fallback."""
+    os.environ["SELFCHECK_WINDOW"] = "90"
+    os.environ["YT_SELFCHECK_WINDOW"] = "1440"
+    assert pipeline_utils.env_int("SELFCHECK_WINDOW", 30) == 90
+    assert pipeline_utils.env_int("SELFCHECK_WINDOW", 30, prefix="YT") == 1440
+    assert pipeline_utils.env_int("SELFCHECK_WINDOW", 30, prefix="TT") == 90, "prefix must fall back to the bare name"
+    assert pipeline_utils.env_int("SELFCHECK_ABSENT", 30) == 30
+
+    os.environ["SELFCHECK_WINDOW"] = "not-a-number"
+    assert pipeline_utils.env_int("SELFCHECK_WINDOW", 30) == 30, "a malformed value must fall back, not crash a cron run"
+
+    os.environ["SELFCHECK_LANGS"] = "EN, fa "
+    assert pipeline_utils.env_set("SELFCHECK_LANGS", {"en"}) == {"en", "fa"}
+    os.environ["SELFCHECK_DELAY"] = "3,6"
+    assert pipeline_utils.env_range("SELFCHECK_DELAY", (1.0, 2.0)) == (3.0, 6.0)
+    os.environ["SELFCHECK_DELAY"] = "6,3"
+    assert pipeline_utils.env_range("SELFCHECK_DELAY", (1.0, 2.0)) == (1.0, 2.0), "min > max must be rejected"
+    os.environ["SELFCHECK_FLAG"] = "off"
+    assert pipeline_utils.env_bool("SELFCHECK_FLAG", True) is False
+
+    # Discovery mode must be settable with no terminal input at all.
+    os.environ["SCRAPE_MODE"] = "accounts"
+    assert pipeline_utils.get_scrape_mode() == "accounts"
+    os.environ["TT_SCRAPE_MODE"] = "keyword"
+    assert pipeline_utils.get_scrape_mode(prefix="TT") == "keyword"
+    del os.environ["SCRAPE_MODE"], os.environ["TT_SCRAPE_MODE"]
+
+    assert pipeline_utils.keyword_matches("Prices of crude oil rose", "oil prices")
+    assert not pipeline_utils.keyword_matches("Gold hit a record", "oil prices")
+    assert not pipeline_utils.keyword_matches("anything", ""), "an empty keyword must not match everything"
+    print("config helpers: ok")
+
+
+def check_record_file():
+    """RecordFile must append to prior runs and keep the file chronological."""
+    older = make_record("X", *PLATFORMS["X"])
+    newer = make_record("X", *PLATFORMS["X"])
+    newer["record_id"] = newer["record_id"] + "2"
+    older["time_stamps"]["published_at"] = "2026-08-20 10:00:00 UTC"
+    newer["time_stamps"]["published_at"] = "2026-08-21 10:00:00 UTC"
+    stamp = pipeline_utils.parse_record_timestamp
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "out.json")
+        first = pipeline_utils.RecordFile(path)
+        first.add(newer, stamp(newer["time_stamps"]["published_at"]))
+        assert first.save() is True
+
+        # A second run appends without losing or reordering the first run's data.
+        second = pipeline_utils.RecordFile(path)
+        assert second.has(newer["record_id"]), "existing records must be seen by the next run"
+        second.add(older, stamp(older["time_stamps"]["published_at"]))
+        assert second.save() is True
+
+        stored = json.load(open(path, encoding="utf-8"))
+        assert [r["record_id"] for r in stored] == [older["record_id"], newer["record_id"]], stored
+        assert pipeline_utils.RecordFile(path).save() is False, "an empty run must not rewrite the file"
+    print("record file: ok")
+
+
+def check_fa_analysis_routing():
+    """A Persian record must be scored and asset-matched on its translation.
+
+    The registry aliases and both models are English-only, so routing the raw
+    Persian text into them would silently produce no assets and no sentiment.
+    The models themselves are stubbed here: this checks the routing, which is
+    the part that breaks silently.
+    """
+    original = pipeline_utils.translate_fa_to_en
+    original_sentiment = pipeline_utils.analyze_sentiment
+    original_assets = pipeline_utils.extract_asset_mentions
+    seen = {}
+    try:
+        def fake_sentiment(text):
+            seen["sentiment_input"] = text
+            return {"label": "positive", "confidence": 0.9}
+
+        def fake_assets(text, context_terms=None):
+            seen["asset_input"] = text
+            return []
+
+        pipeline_utils.translate_fa_to_en = lambda text: "oil prices rose"
+        pipeline_utils.analyze_sentiment = fake_sentiment
+        pipeline_utils.extract_asset_mentions = fake_assets
+
+        translated, sentiment, _ = pipeline_utils.analyze_text("قیمت نفت بالا رفت", "fa")
+        assert translated == "oil prices rose", translated
+        assert seen["sentiment_input"] == "oil prices rose", seen
+        assert seen["asset_input"] == "oil prices rose", seen
+        assert sentiment["label"] == "positive"
+
+        seen.clear()
+        translated, _, _ = pipeline_utils.analyze_text("Oil prices rose", "en")
+        assert translated is None, "an English record must not carry a translation"
+        assert seen["asset_input"] == "Oil prices rose", seen
+
+        # With the translation model unavailable the original text is still
+        # analysed, so cashtags and Latin symbols stay matchable.
+        seen.clear()
+        pipeline_utils.translate_fa_to_en = lambda text: None
+        translated, sentiment, _ = pipeline_utils.analyze_text("$BTC بالا رفت", "fa")
+        assert translated is None and sentiment["label"] is None, sentiment
+        assert seen["asset_input"] == "$BTC بالا رفت", seen
+    finally:
+        pipeline_utils.translate_fa_to_en = original
+        pipeline_utils.analyze_sentiment = original_sentiment
+        pipeline_utils.extract_asset_mentions = original_assets
+    print("fa/en analysis routing: ok")
+
+
+def main():
+    for platform, fields in PLATFORMS.items():
+        record = make_record(platform, *fields)
+        quality = build_quality(record)
+        assert quality["quality_score"] == 100, f"{platform}: {quality}"
+        assert quality["is_complete"], f"{platform}: {quality['missing_fields']}"
+
+        # A URL pointing at another account must fail the identity checks, not
+        # be waved through by a generic http(s) fallback.
+        broken = make_record(platform, *fields)
+        broken["Source"]["url"] = "https://example.com/not-the-post"
+        assert "valid_url" in build_quality(broken)["missing_fields"], f"{platform}: URL check is not platform-aware"
+
+        # record_id must stay derived from platform + author + native id.
+        broken = make_record(platform, *fields)
+        broken["record_id"] = "wrong_id"
+        assert "consistent_record_id" in build_quality(broken)["missing_fields"], f"{platform}: record_id check missing"
+
+        # An unknown Content_type must be rejected per platform.
+        broken = make_record(platform, *fields)
+        broken["Content"]["Content_type"] = "something_else"
+        assert "valid_content_type" in build_quality(broken)["missing_fields"], f"{platform}: content type check missing"
+
+        print(f"{platform}: ok")
+
+    unknown = make_record("Facebook", "someone", "123", "https://example.com/p/123", "post",
+                          {"has_media": False, "media_type": None, "media_url": None})
+    assert "valid_platform" in build_quality(unknown)["missing_fields"], "unregistered platform must fail"
+    print("unregistered platform rejected: ok")
+
+    check_config_helpers()
+    check_record_file()
+    check_fa_analysis_routing()
+
+
+if __name__ == "__main__":
+    main()

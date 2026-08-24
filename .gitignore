@@ -14,10 +14,16 @@ sentiments/
 yt-transcripts/
 twtr-tweets/
 tel-transcripts/
+reddit-posts/
+tiktok-videos/
+truth-posts/
 x-tweet-fetcher/
 cache/
+social_scrapers_documentation_company_style_fa.pdf
 
 # Security & Credentials
+.env
+
 twtr-keywords.txt
 twtr-accounts.txt
 twtr-scraper.log
@@ -26,9 +32,25 @@ yt-channels.txt
 yt-scraper.log
 tel-channels.txt
 tel-scraper.log
+reddit-keywords.txt
+reddit-subreddits.txt
+reddit-scraper.log
+tiktok-accounts.txt
+tiktok-keywords.txt
+tiktok-scraper.log
+truth-accounts.txt
+truth-keywords.txt
+truth-scraper.log
 
 # Telethon login sessions are live account credentials.
 *.session
 *.session-journal
 
 dedup-index.db
+
+test.py
+
+# Runner artifacts (scheduled runs)
+.run-scrapers.lock
+run-scrapers.log
+.env.bak.*

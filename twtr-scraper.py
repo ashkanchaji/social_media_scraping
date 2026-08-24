@@ -1,6 +1,8 @@
 import os
+import io
 import re
 import time
+import contextlib
 import random
 import json
 import bisect
@@ -15,29 +17,61 @@ from pipeline_utils import (
     with_retry,
     RateLimiter,
     detect_language,
-    extract_asset_mentions,
     build_quality,
+    analyze_text,
+    get_scrape_mode,
+    env_int,
+    env_float,
+    env_set,
+    env_range,
 )
 
 logger = setup_logging("twtr-scraper", log_file="twtr-scraper.log")
 
-MAX_RESULTS_PER_KEYWORD = 100
-MAX_PAST_DAYS = 30
+# Every constant below is overridable from .env (see .env.example): the bare
+# name applies to all scrapers, an "X_"-prefixed name applies to this one only.
+MAX_RESULTS_PER_KEYWORD = env_int("MAX_RESULTS_PER_KEYWORD", 100, prefix="X")
+MAX_PAST_MINUTES = env_int("MAX_PAST_MINUTES", 30 * 24 * 60, prefix="X")  # default 30 days
 
-FETCH_MAX_WORKERS = 10           # concurrent tweet fetches
-FETCH_MIN_INTERVAL = 0.5         # seconds between fetch calls, enforced globally across all workers
-DDGS_DELAY_RANGE = (12.0, 18.0)  # Pacing delay between keyword searches
-DDGS_MAX_RETRIES = 3             # Number of retry attempts on rate limit/timeout
+# Account-only mode has no keyword to narrow the search, so every trusted
+# account's timeline is pulled up to this many recent tweets (xtf's
+# fetch_timeline pages nitter search up to 10 pages -- this is that ceiling,
+# not an arbitrary cap). ponytail: nitter search has no cursor exposed past
+# that page budget, so an account posting more than this within the time
+# window will miss the oldest of them; upgrade path is asking xtf for a
+# cursor-based fetch_timeline if that ever matters in practice.
+ACCOUNT_MODE_FETCH_LIMIT = env_int("ACCOUNT_MODE_FETCH_LIMIT", 200, prefix="X")
 
-LANGUAGE_MIN_CONFIDENCE = 0.70
+FETCH_MAX_WORKERS = env_int("FETCH_MAX_WORKERS", 10, prefix="X")            # concurrent tweet fetches
+FETCH_MIN_INTERVAL = env_float("FETCH_MIN_INTERVAL", 0.5, prefix="X")      # seconds between fetch calls, enforced globally across all workers
+DDGS_DELAY_RANGE = env_range("DDGS_DELAY_RANGE", (12.0, 18.0), prefix="X")  # Pacing delay between keyword searches
+DDGS_MAX_RETRIES = env_int("DDGS_MAX_RETRIES", 3, prefix="X")              # Number of retry attempts on rate limit/timeout
+
+LANGUAGE_MIN_CONFIDENCE = env_float("LANGUAGE_MIN_CONFIDENCE", 0.70, prefix="X")
+ALLOWED_LANGUAGES = env_set("ALLOWED_LANGUAGES", {"en", "fa"}, prefix="X")
 
 _fetch_rate_limiter = RateLimiter(FETCH_MIN_INTERVAL)
 
 try:
     from xtf import Router, NotFound, RateLimited
+    from xtf.exceptions import XtfError
 except ImportError:
     logger.error("x-tweet-fetcher is not installed.")
     exit(1)
+
+
+@contextlib.contextmanager
+def _quiet_xtf():
+    """Swallows xtf's per-instance/per-backend stderr chatter.
+
+    xtf narrates every nitter instance and router fall-through on stderr; it
+    is a vendored third-party package, so the noise is filtered here instead
+    of patched there. The failure itself still surfaces as a raised XtfError,
+    which this scraper logs with its own format. Logging handlers hold the
+    real stderr from setup_logging, so scraper output is unaffected.
+    """
+    with contextlib.redirect_stderr(io.StringIO()):
+        yield
 
 TWEET_URL_RE = re.compile(r"https?://(?:www\.)?(?:x|twitter)\.com/([A-Za-z0-9_]+)/status/(\d+)")
 EXTERNAL_URL_RE = re.compile(r"https?://(?!twitter\.com|x\.com)\S+")
@@ -69,15 +103,18 @@ def extract_tweet_ref(url: str):
     return m.group(1), m.group(2)
 
 
-def discover_tweet_urls(keyword: str, trusted_accounts: list, max_results: int = 15) -> list:
-    """
-    Searches DuckDuckGo for tweet URLs matching the keyword and trusted accounts.
-    Retries on rate limits or timeouts with backoff delays instead of skipping.
-    """
-    logger.info(f"Searching for: {keyword}...")
-    account_filter = " OR ".join(f"from:{a}" for a in trusted_accounts)
-    query = f"site:x.com {keyword} ({account_filter})"
+def _ddg_tweet_refs(query: str, label: str, max_results: int, allowed: set = None) -> list:
+    """Runs one DuckDuckGo query and returns the (username, tweet_id) refs in it.
 
+    Shared by keyword discovery and by the account-mode fallback, so both
+    paths get the same retry/backoff and the same per-query pacing delay.
+
+    ``allowed`` is the set of handles the caller will accept. DuckDuckGo is a
+    web search, not X's own search: "from:acct" is an X operator it does not
+    honour, so a query scoped that way still returns tweets by whoever else
+    quoted or replied. The scoping therefore has to be enforced here on the
+    parsed URLs, or untrusted accounts end up in the output.
+    """
     found_urls = set()
     results = []
 
@@ -96,28 +133,84 @@ def discover_tweet_urls(keyword: str, trusted_accounts: list, max_results: int =
             wait_time = random.uniform(20.0, 30.0) * attempt
             if attempt < DDGS_MAX_RETRIES:
                 logger.warning(
-                    f"DDGS {type(e).__name__} on '{keyword}' (attempt {attempt}/{DDGS_MAX_RETRIES}). "
+                    f"DDGS {type(e).__name__} on '{label}' (attempt {attempt}/{DDGS_MAX_RETRIES}). "
                     f"Backing off for {wait_time:.1f}s before retry..."
                 )
                 time.sleep(wait_time)
             else:
-                logger.warning(f"DDGS {type(e).__name__} on '{keyword}'. Exhausted {DDGS_MAX_RETRIES} attempts.")
+                logger.warning(f"DDGS {type(e).__name__} on '{label}'. Exhausted {DDGS_MAX_RETRIES} attempts.")
                 results = []
         except Exception as e:
-            logger.warning(f"DDGS error on '{keyword}': {str(e).splitlines()[0]}")
+            logger.warning(f"DDGS error on '{label}': {str(e).splitlines()[0]}")
             results = []
             break
         finally:
             time.sleep(random.uniform(*DDGS_DELAY_RANGE))
 
+    allowed = {a.casefold() for a in allowed} if allowed else None
+    dropped = 0
     for r in results:
         ref = extract_tweet_ref(r.get("href", ""))
-        if ref:
-            found_urls.add((ref[0], ref[1]))
+        if not ref:
+            continue
+        if allowed is not None and ref[0].casefold() not in allowed:
+            dropped += 1
+            continue
+        found_urls.add((ref[0], ref[1]))
 
-    final_refs = list(found_urls)[:max_results]
-    logger.info(f"Found {len(final_refs)} candidate posts for '{keyword}'.")
-    return final_refs
+    if dropped:
+        logger.info(f"Dropped {dropped} result(s) for '{label}' from accounts outside the trusted list.")
+    return list(found_urls)[:max_results]
+
+
+def discover_tweet_urls(keyword: str, trusted_accounts: list, max_results: int = 15) -> list:
+    """
+    Searches DuckDuckGo for tweet URLs matching the keyword and trusted accounts.
+    Retries on rate limits or timeouts with backoff delays instead of skipping.
+    """
+    logger.info(f"Searching for: {keyword}...")
+    # The query carries no "from:" clauses any more: DuckDuckGo does not honour
+    # that X operator, so a 100-handle OR-chain only diluted the query text and
+    # returned fewer usable x.com URLs. Scoping is enforced on the results
+    # instead, which measurably raises the number of trusted hits per search.
+    refs = _ddg_tweet_refs(f"site:x.com {keyword}", keyword, max_results,
+                           allowed=set(trusted_accounts))
+    logger.info(f"Found {len(refs)} candidate posts for '{keyword}'.")
+    return refs
+
+
+@with_retry(max_attempts=3, base_delay=3.0, exceptions=(RateLimited, ConnectionError, TimeoutError))
+def _fetch_timeline_refs(username: str, limit: int) -> list:
+    _fetch_rate_limiter.wait()
+    router = Router()
+    with _quiet_xtf():
+        timeline = router.fetch_timeline(username, limit=limit)
+    return [(username, tw.tweet_id) for tw in timeline if tw.tweet_id]
+
+
+def discover_account_tweet_refs(username: str, limit: int = ACCOUNT_MODE_FETCH_LIMIT) -> list:
+    """
+    Lists an account's recent tweet IDs (no keyword, no candidate ranking).
+
+    Preferred path is xtf's own timeline fetch, which is complete and cheap.
+    Its backends (nitter instances, browser driver) go down regularly and
+    independently of DuckDuckGo, though, so a failure there falls back to the
+    same DDG search keyword mode uses, with the keyword left out -- a partial
+    account listing beats losing the account for the whole run.
+    """
+    try:
+        refs = _fetch_timeline_refs(username, limit)
+        if refs:
+            return refs
+        logger.info(f"Timeline for '@{username}' came back empty; falling back to DuckDuckGo.")
+    except XtfError as e:
+        logger.warning(f"Timeline fetch failed for '@{username}' ({e.code}); falling back to DuckDuckGo.")
+
+    # Path-scoped, not "from:" -- x.com/<user>/status/... is a URL pattern the
+    # web index actually matches on.
+    refs = _ddg_tweet_refs(f"site:x.com/{username}", f"@{username}", limit, allowed={username})
+    logger.info(f"Found {len(refs)} candidate posts for '@{username}' via DuckDuckGo.")
+    return refs
 
 
 def _extract_media_info(tw: dict, text: str) -> dict:
@@ -186,7 +279,8 @@ def _extract_media_info(tw: dict, text: str) -> dict:
 def _fetch_tweet_safe(username: str, tweet_id: str) -> dict:
     _fetch_rate_limiter.wait()
     router = Router()
-    return router.fetch_tweet(username, tweet_id)
+    with _quiet_xtf():
+        return router.fetch_tweet(username, tweet_id)
 
 
 def _parse_created_at(created_raw):
@@ -361,19 +455,8 @@ def _insert_sorted(records_list: list, timestamps_list: list, record: dict, dt_v
     timestamps_list.insert(idx, sort_key)
 
 
-def search_and_scrape_tweets(keyword: str, trusted_accounts: list, lsh, hash_by_id, output_dir: str = "twtr-tweets/"):
-    os.makedirs(output_dir, exist_ok=True)
-    today = datetime.datetime.now(datetime.timezone.utc)
-    cutoff = today - datetime.timedelta(days=MAX_PAST_DAYS)
-
-    safe_keyword = keyword.replace(" ", "_").lower()
-    master_file = os.path.join(output_dir, f"twitter_{safe_keyword}.json")
-
-    # Load existing records and create fast lookup sets
-    existing_records = []
-    existing_ids = set()
-    existing_timestamps = []
-
+def _load_existing(master_file: str) -> tuple:
+    existing_records, existing_ids, existing_timestamps = [], set(), []
     if os.path.exists(master_file):
         try:
             with open(master_file, 'r', encoding='utf-8') as f:
@@ -382,31 +465,31 @@ def search_and_scrape_tweets(keyword: str, trusted_accounts: list, lsh, hash_by_
                     rec_id = rec.get("record_id")
                     if rec_id:
                         existing_ids.add(rec_id)
-                    # Extract timestamp for maintaining sorted insertion
                     pub_str = rec.get("time_stamps", {}).get("published_at")
                     dt_obj, _ = _parse_created_at(pub_str)
                     existing_timestamps.append(dt_obj.timestamp() if dt_obj else 0.0)
         except Exception as e:
             logger.error(f"Error reading {master_file}: {e}")
-            existing_records = []
-            existing_ids = set()
-            existing_timestamps = []
+            existing_records, existing_ids, existing_timestamps = [], set(), []
+    return existing_records, existing_ids, existing_timestamps
 
-    refs = discover_tweet_urls(keyword, trusted_accounts=trusted_accounts, max_results=MAX_RESULTS_PER_KEYWORD)
-    if not refs:
-        logger.info(f"No candidate posts found for '{keyword}'.")
-        return None
 
-    # Filter out tweets that were already collected before making fetch requests
-    new_refs = []
-    for username, tweet_id in refs:
-        potential_id = f"X_{username}_{tweet_id}"
-        if potential_id in existing_ids or potential_id in hash_by_id:
-            continue
-        new_refs.append((username, tweet_id))
+def _fetch_and_write_tweets(refs: list, master_file: str, context_terms: list,
+                            lsh, hash_by_id, log_label: str) -> str:
+    """
+    Shared fetch/filter/write core for both keyword mode and account-only
+    mode -- they differ only in how ``refs`` (username, tweet_id) pairs are
+    discovered and what context_terms feed asset detection.
+    """
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=MAX_PAST_MINUTES)
+    existing_records, existing_ids, existing_timestamps = _load_existing(master_file)
 
+    new_refs = [
+        (username, tweet_id) for username, tweet_id in refs
+        if f"X_{username}_{tweet_id}" not in existing_ids and f"X_{username}_{tweet_id}" not in hash_by_id
+    ]
     if not new_refs:
-        logger.info(f"All discovered tweets for '{keyword}' have already been gathered.")
+        logger.info(f"All discovered tweets for '{log_label}' have already been gathered.")
         return master_file
 
     fetched = []
@@ -425,7 +508,7 @@ def search_and_scrape_tweets(keyword: str, trusted_accounts: list, lsh, hash_by_
                 fetched.append((username, tweet_id, tw))
 
     added_count = 0
-    skipped_non_english = 0
+    skipped_unsupported_lang = 0
 
     for username, tweet_id, tw in fetched:
         text, text_is_complete, extraction_errors, extraction_reliability = _extract_tweet_text(tw)
@@ -439,8 +522,8 @@ def search_and_scrape_tweets(keyword: str, trusted_accounts: list, lsh, hash_by_
         clean_text = text.replace("\n", " ")
 
         lang, confidence = detect_language(clean_text)
-        if lang != "en" or confidence < LANGUAGE_MIN_CONFIDENCE:
-            skipped_non_english += 1
+        if lang not in ALLOWED_LANGUAGES or confidence < LANGUAGE_MIN_CONFIDENCE:
+            skipped_unsupported_lang += 1
             continue
 
         author_name, author_id = _extract_author_identity(tw, username)
@@ -456,6 +539,8 @@ def search_and_scrape_tweets(keyword: str, trusted_accounts: list, lsh, hash_by_
         media_info = _extract_media_info(tw, text)
         collected_at = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         updated_at = _extract_updated_at(tw)
+        translated_text, sentiment, asset_mention = analyze_text(
+            clean_text, lang, context_terms=context_terms)
 
         record = {
             "record_id": record_id,
@@ -473,14 +558,16 @@ def search_and_scrape_tweets(keyword: str, trusted_accounts: list, lsh, hash_by_
                 "title": "N/A",
                 "raw_text": clean_text,
                 "Clean_text": "",
-                "language": lang
+                "language": lang,
+                "translated_text": translated_text
             },
             "time_stamps": {
                 "published_at": created_str,
                 "collected_at": collected_at,
                 "updated_at": updated_at
             },
-            "asset_mention": extract_asset_mentions(clean_text, context_terms=[keyword]),
+            "asset_mention": asset_mention,
+            "sentiment": sentiment,
             "Engagement": {
                 "Views": tw.get("views") or tw.get("view_count") or 0,
                 "likes": tw.get("likes") or tw.get("like_count") or 0,
@@ -501,23 +588,76 @@ def search_and_scrape_tweets(keyword: str, trusted_accounts: list, lsh, hash_by_
         existing_ids.add(record_id)
         added_count += 1
 
-    if skipped_non_english:
-        logger.info(f"Filtered out {skipped_non_english} non-English post(s) for '{keyword}'.")
+    if skipped_unsupported_lang:
+        logger.info(f"Filtered out {skipped_unsupported_lang} unsupported-language post(s) for '{log_label}'.")
 
     if added_count > 0:
         with open(master_file, 'w', encoding='utf-8') as f:
             json.dump(existing_records, f, indent=4, ensure_ascii=False)
         logger.info(f"Appended {added_count} new sorted tweets to {master_file} (Total: {len(existing_records)}).")
     else:
-        logger.info(f"No new unique tweets to append for '{keyword}'.")
+        logger.info(f"No new unique tweets to append for '{log_label}'.")
 
     return master_file
 
 
-def main():
-    keyword_file = "twtr-keywords.txt"
-    accounts_file = "twtr-accounts.txt"
+def search_and_scrape_tweets(keyword: str, trusted_accounts: list, lsh, hash_by_id, output_dir: str = "twtr-tweets/"):
+    """Keyword mode: DDG-discovered tweets scoped to the trusted accounts."""
+    os.makedirs(output_dir, exist_ok=True)
+    safe_keyword = keyword.replace(" ", "_").lower()
+    master_file = os.path.join(output_dir, f"twitter_{safe_keyword}.json")
 
+    refs = discover_tweet_urls(keyword, trusted_accounts=trusted_accounts, max_results=MAX_RESULTS_PER_KEYWORD)
+    if not refs:
+        logger.info(f"No candidate posts found for '{keyword}'.")
+        return None
+
+    return _fetch_and_write_tweets(refs, master_file, context_terms=[keyword],
+                                   lsh=lsh, hash_by_id=hash_by_id, log_label=keyword)
+
+
+def scrape_account_tweets(username: str, lsh, hash_by_id, output_dir: str = "twtr-tweets/"):
+    """
+    Account-only mode: every recent tweet from one trusted account, no
+    keyword filtering or candidate selection. Relevance is left entirely to
+    the asset-mapping stage, the same trust model tel/tiktok/truth-scraper
+    already use for their account-driven discovery.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    safe_username = username.replace(" ", "_").lower()
+    master_file = os.path.join(output_dir, f"twitter_{safe_username}.json")
+
+    refs = discover_account_tweet_refs(username, limit=ACCOUNT_MODE_FETCH_LIMIT)
+    if not refs:
+        logger.info(f"No recent tweets found for '@{username}'.")
+        return None
+
+    return _fetch_and_write_tweets(refs, master_file, context_terms=[],
+                                   lsh=lsh, hash_by_id=hash_by_id, log_label=f"@{username}")
+
+
+def main():
+    accounts_file = "twtr-accounts.txt"
+    trusted_accounts = load_trusted_accounts(accounts_file)
+    logger.info(f"Loaded {len(trusted_accounts)} trusted accounts from {accounts_file}.")
+
+    mode = get_scrape_mode(logger, prefix="X")
+
+    run_timestamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    logger.info(f"Starting scraping run {run_timestamp} for X (Twitter) in '{mode}' mode...")
+
+    lsh, hash_by_id = dedup_utils.load_lsh()
+
+    if mode == "accounts":
+        for account in trusted_accounts:
+            try:
+                scrape_account_tweets(account, lsh, hash_by_id)
+            except Exception as e:
+                logger.error(f"Error scraping account '@{account}': {str(e).splitlines()[0]}")
+        logger.info("Scraping for all trusted accounts is done.")
+        return
+
+    keyword_file = "twtr-keywords.txt"
     if not os.path.exists(keyword_file):
         logger.error(f"File '{keyword_file}' not found.")
         return
@@ -528,14 +668,6 @@ def main():
     if not keywords:
         logger.error(f"No keywords found in {keyword_file}.")
         return
-
-    trusted_accounts = load_trusted_accounts(accounts_file)
-    logger.info(f"Loaded {len(trusted_accounts)} trusted accounts from {accounts_file}.")
-
-    run_timestamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-    logger.info(f"Starting scraping run {run_timestamp} for X (Twitter)...")
-
-    lsh, hash_by_id = dedup_utils.load_lsh()
 
     for keyword in keywords:
         try:

@@ -13,6 +13,10 @@ reports/
 sentiments/
 yt-transcripts/
 twtr-tweets/
+tel-transcripts/
+reddit-posts/
+tiktok-videos/
+truth-posts/
 x-tweet-fetcher/
 cache/
 
@@ -23,5 +27,20 @@ twtr-scraper.log
 yt-keywords.txt
 yt-channels.txt
 yt-scraper.log
+tel-channels.txt
+tel-scraper.log
+reddit-keywords.txt
+reddit-subreddits.txt
+reddit-scraper.log
+tiktok-accounts.txt
+tiktok-scraper.log
+truth-accounts.txt
+truth-scraper.log
+
+# Telethon login sessions are live account credentials.
+*.session
+*.session-journal
 
 dedup-index.db
+
+test.py

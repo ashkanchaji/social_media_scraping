@@ -11,9 +11,10 @@ periodically from cron or a systemd timer rather than looping internally.
 
 Prerequisites:
   1. pip install -r requirements.txt --break-system-packages
-  2. Create an application at https://my.telegram.org to get api_id/api_hash:
-       export TELEGRAM_API_ID=...
-       export TELEGRAM_API_HASH=...
+  2. Create an application at https://my.telegram.org to get api_id/api_hash,
+     then put them in .env (loaded automatically by pipeline_utils.py):
+       TELEGRAM_API_ID=...
+       TELEGRAM_API_HASH=...
   3. Create tel-channels.txt with one public channel username per line.
 
 The first run performs an interactive phone-number + login-code sign-in and
@@ -32,34 +33,46 @@ import dedup_utils
 from pipeline_utils import (
     setup_logging,
     detect_language,
-    extract_asset_mentions,
     build_quality,
+    analyze_text,
+    env_int,
+    env_float,
+    env_set,
+    env_bool,
+    env_range,
+    env_str,
 )
 
 logger = setup_logging("tel-scraper", log_file="tel-scraper.log")
 
-# How far back each run looks. This is the knob to change when you want a
-# wider or narrower polling window; keep it comfortably larger than the
-# interval your scheduler invokes the script at so nothing falls between runs.
-TIME_WINDOW_MINUTES = 60
+# How far back each run looks. Named MAX_PAST_MINUTES like every other
+# scraper's window so one .env value can set them all; keep it comfortably
+# larger than the interval your scheduler invokes the script at so nothing
+# falls between runs.
+# Every constant below is overridable from .env (see .env.example): the bare
+# name applies to all scrapers, a "TEL_"-prefixed name applies to this one only.
+MAX_PAST_MINUTES = env_int("MAX_PAST_MINUTES", 1440, prefix="TEL")
 
-LANGUAGE_MIN_CONFIDENCE = 0.70
-CHANNEL_DELAY_RANGE = (3.0, 6.0)  # Jittered pause between channels
-MAX_MESSAGES_PER_CHANNEL = 500    # Safety cap per channel per run
+LANGUAGE_MIN_CONFIDENCE = env_float("LANGUAGE_MIN_CONFIDENCE", 0.70, prefix="TEL")
+# Most trusted Telegram channels post in Persian, not English, so both are
+# kept rather than filtering the majority of messages out as "non-English".
+ALLOWED_LANGUAGES = env_set("ALLOWED_LANGUAGES", {"en", "fa"}, prefix="TEL")
+CHANNEL_DELAY_RANGE = env_range("CHANNEL_DELAY_RANGE", (3.0, 6.0), prefix="TEL")  # Jittered pause between channels
+MAX_MESSAGES_PER_CHANNEL = env_int("MAX_MESSAGES_PER_CHANNEL", 500, prefix="TEL")  # Safety cap per channel per run
 
 # Re-scan the whole window (instead of only messages newer than the newest one
 # already saved) so edits to already-collected posts are picked up and the
 # stored record is refreshed. Set to False for the cheapest possible append-only
 # run at the cost of never seeing an edit.
-REFRESH_EDITED_MESSAGES = True
+REFRESH_EDITED_MESSAGES = env_bool("REFRESH_EDITED_MESSAGES", True, prefix="TEL")
 
 # Telethon transparently sleeps through flood waits shorter than this; longer
 # ones surface as FloodWaitError and are handled by _with_flood_retry.
-FLOOD_SLEEP_THRESHOLD = 60
-FLOOD_WAIT_BUFFER = 5             # Extra seconds added to a server-dictated wait
-MAX_FLOOD_RETRIES = 3
+FLOOD_SLEEP_THRESHOLD = env_int("FLOOD_SLEEP_THRESHOLD", 60, prefix="TEL")
+FLOOD_WAIT_BUFFER = env_int("FLOOD_WAIT_BUFFER", 5, prefix="TEL")  # Extra seconds added to a server-dictated wait
+MAX_FLOOD_RETRIES = env_int("MAX_FLOOD_RETRIES", 3, prefix="TEL")
 
-TELEGRAM_SESSION_NAME = os.environ.get("TELEGRAM_SESSION_NAME", "tel-scraper")
+TELEGRAM_SESSION_NAME = env_str("TELEGRAM_SESSION_NAME", "tel-scraper")
 TELEGRAM_API_ID = os.environ.get("TELEGRAM_API_ID")
 TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH")
 
@@ -243,6 +256,7 @@ def _build_record(message, channel_username: str, channel_title: str, clean_text
                   lang: str, duplication_info: dict, collected_at: str) -> dict:
     """Assembles one message into the shared cross-platform record schema."""
     post_url = f"https://t.me/{channel_username}/{message.id}"
+    translated_text, sentiment, asset_mention = analyze_text(clean_text, lang)
     record = {
         "record_id": f"Telegram_{channel_username}_{message.id}",
         "Source": {
@@ -259,7 +273,8 @@ def _build_record(message, channel_username: str, channel_title: str, clean_text
             "title": "N/A",
             "raw_text": clean_text,
             "Clean_text": "",
-            "language": lang
+            "language": lang,
+            "translated_text": translated_text
         },
         "time_stamps": {
             "published_at": _format_timestamp(message.date),
@@ -268,7 +283,8 @@ def _build_record(message, channel_username: str, channel_title: str, clean_text
             # carries a real value instead of always being null.
             "updated_at": _format_timestamp(getattr(message, "edit_date", None))
         },
-        "asset_mention": extract_asset_mentions(clean_text),
+        "asset_mention": asset_mention,
+        "sentiment": sentiment,
         "Engagement": _build_engagement(message),
         "media": _extract_media_info(message, post_url),
         "deduplication": duplication_info
@@ -283,7 +299,7 @@ async def scrape_channel(client, channel_username: str, lsh, hash_by_id, output_
     """
     os.makedirs(output_dir, exist_ok=True)
     now = datetime.datetime.now(datetime.timezone.utc)
-    cutoff = now - datetime.timedelta(minutes=TIME_WINDOW_MINUTES)
+    cutoff = now - datetime.timedelta(minutes=MAX_PAST_MINUTES)
 
     safe_channel = channel_username.replace(" ", "_").lower()
     master_file = os.path.join(output_dir, f"telegram_{safe_channel}.json")
@@ -358,7 +374,7 @@ async def scrape_channel(client, channel_username: str, lsh, hash_by_id, output_
         return None
 
     if not messages:
-        logger.info(f"No messages in the last {TIME_WINDOW_MINUTES} minute(s) for '@{resolved_username}'.")
+        logger.info(f"No messages in the last {MAX_PAST_MINUTES} minute(s) for '@{resolved_username}'.")
         return master_file
 
     added_count = 0
@@ -383,7 +399,7 @@ async def scrape_channel(client, channel_username: str, lsh, hash_by_id, output_
                 continue
 
             lang, confidence = detect_language(clean_text)
-            if lang != "en" or confidence < LANGUAGE_MIN_CONFIDENCE:
+            if lang not in ALLOWED_LANGUAGES or confidence < LANGUAGE_MIN_CONFIDENCE:
                 continue
 
             duplication_info = dedup_utils.check_and_register(record_id, clean_text, lsh, hash_by_id)
@@ -399,7 +415,7 @@ async def scrape_channel(client, channel_username: str, lsh, hash_by_id, output_
             continue
 
         lang, confidence = detect_language(clean_text)
-        if lang != "en" or confidence < LANGUAGE_MIN_CONFIDENCE:
+        if lang not in ALLOWED_LANGUAGES or confidence < LANGUAGE_MIN_CONFIDENCE:
             skipped_non_english += 1
             continue
 
@@ -419,7 +435,7 @@ async def scrape_channel(client, channel_username: str, lsh, hash_by_id, output_
         added_count += 1
 
     if skipped_non_english:
-        logger.info(f"Filtered out {skipped_non_english} non-English message(s) for '@{resolved_username}'.")
+        logger.info(f"Filtered out {skipped_non_english} message(s) for '@{resolved_username}' in an unsupported language.")
 
     if added_count or refreshed_count:
         with open(master_file, 'w', encoding='utf-8') as f:
@@ -438,7 +454,7 @@ async def run():
     if not TELEGRAM_API_ID or not TELEGRAM_API_HASH:
         logger.error(
             "TELEGRAM_API_ID and TELEGRAM_API_HASH must be set. Create an "
-            "application at https://my.telegram.org, then export both values."
+            "application at https://my.telegram.org, then put both values in .env."
         )
         return
 
@@ -458,7 +474,7 @@ async def run():
     run_timestamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     logger.info(
         f"Starting scraping run {run_timestamp} for Telegram "
-        f"(window: last {TIME_WINDOW_MINUTES} minute(s))..."
+        f"(window: last {MAX_PAST_MINUTES} minute(s))..."
     )
 
     lsh, hash_by_id = dedup_utils.load_lsh()

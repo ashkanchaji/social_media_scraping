@@ -4,8 +4,6 @@ import time
 import random
 import json
 import bisect
-import tempfile
-import threading
 import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -17,8 +15,15 @@ from pipeline_utils import (
     with_retry,
     RateLimiter,
     detect_language,
-    extract_asset_mentions,
     build_quality,
+    get_whisper_model,
+    transcribe_audio,
+    analyze_text,
+    get_scrape_mode,
+    env_int,
+    env_float,
+    env_set,
+    env_range,
 )
 
 # Silence huggingface hub warnings
@@ -27,98 +32,33 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 logger = setup_logging("yt-scraper", log_file="yt-scraper.log")
 
-MAX_RESULTS_PER_KEYWORD = 30
-MAX_PAST_DAYS = 30
-MAX_VIDEO_DURATION_SECONDS = 1200  # 20 minutes max (skips 24/7 live broadcasts)
+# Every constant below is overridable from .env (see .env.example): the bare
+# name applies to all scrapers, a "YT_"-prefixed name applies to this one only.
+MAX_RESULTS_PER_KEYWORD = env_int("MAX_RESULTS_PER_KEYWORD", 30, prefix="YT")
+MAX_PAST_MINUTES = env_int("MAX_PAST_MINUTES", 30 * 24 * 60, prefix="YT")  # default 30 days
+MAX_VIDEO_DURATION_SECONDS = env_int("MAX_VIDEO_DURATION_SECONDS", 3600, prefix="YT")  # skips 24/7 live broadcasts
 
-# "base.en" is English-only and will hallucinate fluent-sounding but
-# meaningless English text when given non-English audio (it has no notion
-# of any other language, so it just pattern-matches sounds to English
-# words). Using a multilingual model + task="translate" (below) instead
-# lets Whisper auto-detect the spoken language and translate it to English
-# properly, matching the quality of YouTube's own auto-translate captions.
-# "small" is a reasonable speed/quality balance for an RTX 3070; bump to
-# "medium" if translation quality on non-English sources still looks weak.
-WHISPER_MODEL_SIZE = "small"
+# Account-only mode lists a channel's uploads tab directly instead of
+# searching, so this is the "collect everything recent" cap rather than a
+# relevance-ranked result count.
+MAX_VIDEOS_PER_CHANNEL = env_int("MAX_VIDEOS_PER_CHANNEL", 50, prefix="YT")
 
-FETCH_MAX_WORKERS = 4              # Concurrent audio/metadata workers
-FETCH_MIN_INTERVAL = 1.0           # Seconds between video calls enforced globally
-SEARCH_DELAY_RANGE = (8.0, 14.0)   # Pacing delay between keyword searches
-SEARCH_MAX_RETRIES = 3
+# Placeholder used when yt-dlp cannot resolve the canonical UC... channel ID.
+# record_id and author_id must use the SAME value or _record_id_consistent
+# fails on top of _valid_author_id, charging two identity checks for one
+# missing field. author_id is a string field in the schema, so it must not
+# be null either.
+UNRESOLVED_CHANNEL_ID = "unknown"
 
-LANGUAGE_MIN_CONFIDENCE = 0.70
+FETCH_MAX_WORKERS = env_int("FETCH_MAX_WORKERS", 4, prefix="YT")               # Concurrent audio/metadata workers
+FETCH_MIN_INTERVAL = env_float("FETCH_MIN_INTERVAL", 1.0, prefix="YT")         # Seconds between video calls enforced globally
+SEARCH_DELAY_RANGE = env_range("SEARCH_DELAY_RANGE", (8.0, 14.0), prefix="YT")  # Pacing delay between keyword searches
+SEARCH_MAX_RETRIES = env_int("SEARCH_MAX_RETRIES", 3, prefix="YT")
+
+LANGUAGE_MIN_CONFIDENCE = env_float("LANGUAGE_MIN_CONFIDENCE", 0.70, prefix="YT")
+ALLOWED_LANGUAGES = env_set("ALLOWED_LANGUAGES", {"en", "fa"}, prefix="YT")
 
 _fetch_rate_limiter = RateLimiter(FETCH_MIN_INTERVAL)
-
-_whisper_model = None
-_model_lock = threading.Lock()
-
-# Circuit breaker: if the local Whisper backend is broken (e.g. a CUDA-enabled
-# ctranslate2 wheel that still tries to dlopen libcublas even in CPU mode),
-# don't keep burning minutes downloading audio for every video only to fail
-# at transcribe time. After a few consecutive library-load failures, disable
-# Whisper for the rest of the run and fall back to subtitle-only mode.
-_WHISPER_FAILURE_LIMIT = 3
-_whisper_failure_count = 0
-_whisper_disabled = False
-_whisper_state_lock = threading.Lock()
-
-# Substrings that indicate an environment/library problem (not a per-video
-# problem) -- e.g. "Library libcublas.so.12 is not found or cannot be loaded".
-_ENV_FAILURE_MARKERS = ("libcublas", "libcudnn", "cannot be loaded", "cuda")
-
-
-def get_whisper_model():
-    """Lazily loads and caches the faster-whisper model."""
-    global _whisper_model
-    with _model_lock:
-        if _whisper_model is None:
-            try:
-                from faster_whisper import WhisperModel
-                logger.info(f"Initializing faster-whisper model ({WHISPER_MODEL_SIZE})... (this may take a moment on first run)")
-                try:
-                    _whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cuda", compute_type="float16")
-                    logger.info(f"faster-whisper model ({WHISPER_MODEL_SIZE}) successfully loaded and ready (GPU/CUDA).")
-                except Exception as gpu_err:
-                    logger.warning(
-                        f"Could not initialize Whisper on GPU ({str(gpu_err).splitlines()[0]}). "
-                        "Falling back to CPU (int8)."
-                    )
-                    _whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
-                    logger.info(f"faster-whisper model ({WHISPER_MODEL_SIZE}) successfully loaded and ready (CPU fallback).")
-            except ImportError:
-                logger.warning("faster-whisper is not installed. Falling back strictly to subtitle scraping.")
-                _whisper_model = False
-    return _whisper_model
-
-
-def _record_whisper_env_failure(error_text: str) -> bool:
-    """Tracks consecutive environment-level Whisper failures (missing CUDA
-    libs, etc). Returns True once the failure limit is hit and Whisper has
-    been disabled for the rest of this run."""
-    global _whisper_failure_count, _whisper_disabled
-    lowered = error_text.lower()
-    if not any(marker in lowered for marker in _ENV_FAILURE_MARKERS):
-        return False
-
-    with _whisper_state_lock:
-        if _whisper_disabled:
-            return True
-        _whisper_failure_count += 1
-        if _whisper_failure_count >= _WHISPER_FAILURE_LIMIT:
-            _whisper_disabled = True
-            logger.error(
-                f"Whisper failed {_whisper_failure_count} times in a row with an "
-                f"environment/library error ('{error_text}'). Disabling audio "
-                "transcription for the rest of this run and falling back to "
-                "subtitle-only mode. Fix: reinstall a CPU-only ctranslate2 build, "
-                "or run `pip install nvidia-cublas-cu12 nvidia-cudnn-cu12 "
-                "--break-system-packages` and point LD_LIBRARY_PATH at the "
-                "installed nvidia/*/lib directories before the next run."
-            )
-            return True
-    return False
-
 
 def load_trusted_channels(filepath: str = "yt-channels.txt") -> list:
     default_channels = ["Reuters", "Bloomberg", "CNBC", "BBC", "CNN", "Al Jazeera"]
@@ -205,7 +145,7 @@ def fetch_video_metadata(video_url: str) -> dict:
 def search_youtube_videos(keyword: str, trusted_channels: list, max_results: int = 15) -> list:
     logger.info(f"Searching live feed for: {keyword}...")
     today = datetime.datetime.now(datetime.timezone.utc)
-    past_date = today - datetime.timedelta(days=MAX_PAST_DAYS)
+    past_date = today - datetime.timedelta(minutes=MAX_PAST_MINUTES)
     date_filter = f"after:{past_date.strftime('%Y-%m-%d')}"
 
     search_query = f"ytsearch30:{keyword} news {date_filter}"
@@ -254,78 +194,52 @@ def search_youtube_videos(keyword: str, trusted_channels: list, max_results: int
     return valid_entries[:max_results]
 
 
-@with_retry(max_attempts=2, base_delay=3.0, exceptions=(Exception,))
-def _download_audio(video_url: str, video_id: str, out_template: str) -> None:
+@with_retry(max_attempts=3, base_delay=2.0, exceptions=(Exception,))
+def resolve_channel_id(channel_name: str) -> tuple:
+    """
+    Resolves a trusted channel's plain configured name to its canonical
+    UC... channel ID via one cheap search hit, reusing fetch_video_metadata's
+    existing channel_id extraction rather than duplicating it.
+
+    Account-only mode needs a real channel ID to list a channel's uploads tab
+    directly; yt-channels.txt only stores free-text display names (matched by
+    substring in keyword mode), so this is the resolution step that bridges
+    the two. ponytail: trusts the first search hit for that name, the same
+    trust boundary keyword mode's substring match already relies on; upgrade
+    path is letting yt-channels.txt carry an explicit channel ID/URL per line
+    if a name ever resolves to the wrong channel.
+    """
     ydl_opts = {
-        'format': 'bestaudio/best',
-        'outtmpl': out_template,
-        'quiet': True,
-        'no_warnings': True,
-        'noprogress': True,
-        'socket_timeout': 25,
-        'retries': 3,
-        'fragment_retries': 3,
-        # Forcing the android client sidesteps YouTube's current
-        # signature/PO-token checks that were causing blanket 403s on the
-        # web client's adaptive audio streams.
-        'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
-        'http_headers': {
-            'User-Agent': 'com.google.android.youtube/19.09.37 (Linux; U; Android 14) gzip'
-        },
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '128',
-        }],
+        'quiet': True, 'skip_download': True, 'no_warnings': True,
+        'extract_flat': True, 'socket_timeout': 15, 'retries': 3,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([video_url])
+        info = ydl.extract_info(f"ytsearch1:{channel_name} news", download=False)
+    entries = info.get('entries', []) or []
+    video_id = entries[0].get('id') if entries else None
+    if not video_id:
+        return None, None
+
+    meta = fetch_video_metadata(f"https://www.youtube.com/watch?v={video_id}")
+    return meta.get('channel_id'), meta.get('channel')
 
 
-def _transcribe_audio_stream(video_url: str, video_id: str, duration: int = 0) -> str:
-    if duration and duration > MAX_VIDEO_DURATION_SECONDS:
-        logger.info(f"Skipping audio download for {video_id}: duration ({duration}s) exceeds {MAX_VIDEO_DURATION_SECONDS}s cap.")
-        return None
-
-    model = get_whisper_model()
-    if not model or _whisper_disabled:
-        return None
-
-    logger.info(f"Downloading lightweight audio for {video_id}...")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        out_template = os.path.join(tmpdir, f"{video_id}.%(ext)s")
-
-        try:
-            _download_audio(video_url, video_id, out_template)
-
-            audio_file = os.path.join(tmpdir, f"{video_id}.mp3")
-            if not os.path.exists(audio_file):
-                files = os.listdir(tmpdir)
-                if not files:
-                    return None
-                audio_file = os.path.join(tmpdir, files[0])
-
-            logger.info(f"Transcribing audio for {video_id} with Whisper...")
-            start_t = time.time()
-            # task="translate" makes Whisper auto-detect the spoken language
-            # and translate it directly to English, instead of transcribing
-            # verbatim in whatever language is detected. Combined with a
-            # multilingual model (not "*.en"), this is what actually handles
-            # non-English source audio correctly.
-            segments, info = model.transcribe(audio_file, beam_size=2, task="translate")
-            transcript_text = " ".join([seg.text.strip() for seg in segments])
-            elapsed = time.time() - start_t
-            logger.info(
-                f"Finished transcribing {video_id} in {elapsed:.1f}s "
-                f"({len(transcript_text.split())} words, detected source language: {info.language})."
-            )
-            return transcript_text if transcript_text.strip() else None
-
-        except Exception as e:
-            err_text = str(e).splitlines()[0] if str(e) else type(e).__name__
-            logger.warning(f"Audio transcription failed for {video_id}: {err_text}")
-            _record_whisper_env_failure(err_text)
-            return None
+@with_retry(max_attempts=3, base_delay=2.0, exceptions=(Exception,))
+def list_channel_uploads(channel_id: str, max_results: int = MAX_VIDEOS_PER_CHANNEL) -> list:
+    """Lists a channel's most recent uploads directly (no keyword, no candidate ranking)."""
+    ydl_opts = {
+        'quiet': True,
+        'skip_download': True,
+        'no_warnings': True,
+        'extract_flat': True,
+        'playlistend': max_results,
+        'socket_timeout': 15,
+        'retries': 3,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(f"https://www.youtube.com/channel/{channel_id}/videos", download=False)
+    entries = info.get('entries', []) or []
+    return [entry.get('id') for entry in entries if entry.get('id')][:max_results]
 
 
 def extract_video_text(video_url: str, duration: int = 0) -> str:
@@ -352,7 +266,22 @@ def extract_video_text(video_url: str, duration: int = 0) -> str:
 
     # Tier 2: Whisper Audio Fallback
     logger.info(f"Subtitles unavailable for {video_id}. Falling back to audio Whisper transcription...")
-    return _transcribe_audio_stream(video_url, video_id, duration=duration)
+    return transcribe_audio(
+        video_url,
+        video_id,
+        duration=duration,
+        max_duration=MAX_VIDEO_DURATION_SECONDS,
+        # Forcing the android client sidesteps YouTube's current
+        # signature/PO-token checks that were causing blanket 403s on the
+        # web client's adaptive audio streams.
+        extra_opts={
+            'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
+            'http_headers': {
+                'User-Agent': 'com.google.android.youtube/19.09.37 (Linux; U; Android 14) gzip'
+            },
+        },
+        logger=logger,
+    )
 
 
 def _process_single_video(video_id: str) -> tuple:
@@ -378,18 +307,8 @@ def _insert_sorted(records_list: list, timestamps_list: list, record: dict, dt_v
     timestamps_list.insert(idx, sort_key)
 
 
-def search_and_scrape_youtube(keyword: str, trusted_channels: list, lsh, hash_by_id, output_dir: str = "yt-transcripts/"):
-    os.makedirs(output_dir, exist_ok=True)
-    today = datetime.datetime.now(datetime.timezone.utc)
-    cutoff = today - datetime.timedelta(days=MAX_PAST_DAYS)
-
-    safe_keyword = keyword.replace(" ", "_").lower()
-    master_file = os.path.join(output_dir, f"youtube_{safe_keyword}.json")
-
-    existing_records = []
-    existing_ids = set()
-    existing_timestamps = []
-
+def _load_existing_videos(master_file: str) -> tuple:
+    existing_records, existing_ids, existing_timestamps = [], set(), []
     if os.path.exists(master_file):
         try:
             with open(master_file, 'r', encoding='utf-8') as f:
@@ -407,11 +326,18 @@ def search_and_scrape_youtube(keyword: str, trusted_channels: list, lsh, hash_by
         except Exception as e:
             logger.error(f"Error loading {master_file}: {e}")
             existing_records, existing_ids, existing_timestamps = [], set(), []
+    return existing_records, existing_ids, existing_timestamps
 
-    candidate_ids = search_youtube_videos(keyword, trusted_channels, max_results=MAX_RESULTS_PER_KEYWORD)
-    if not candidate_ids:
-        logger.info(f"No video candidates found for '{keyword}'.")
-        return None
+
+def _fetch_and_write_videos(candidate_ids: list, master_file: str, context_terms: list,
+                            lsh, hash_by_id, log_label: str) -> str:
+    """
+    Shared fetch/filter/write core for both keyword mode and account-only
+    mode -- they differ only in how ``candidate_ids`` are discovered and what
+    context_terms feed asset detection.
+    """
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=MAX_PAST_MINUTES)
+    existing_records, existing_ids, existing_timestamps = _load_existing_videos(master_file)
 
     # Match on the exact "_{video_id}" suffix rather than a raw substring
     # check -- a plain `vid in existing_id` could false-positive if the
@@ -421,7 +347,7 @@ def search_and_scrape_youtube(keyword: str, trusted_channels: list, lsh, hash_by
         if not any(existing_id.endswith(f"_{vid}") for existing_id in existing_ids)
     ]
     if not new_candidate_ids:
-        logger.info(f"All discovered videos for '{keyword}' are already scraped.")
+        logger.info(f"All discovered videos for '{log_label}' are already scraped.")
         return master_file
 
     fetched_results = []
@@ -433,7 +359,7 @@ def search_and_scrape_youtube(keyword: str, trusted_channels: list, lsh, hash_by
                 fetched_results.append((vid, vurl, meta, text))
 
     added_count = 0
-    skipped_non_english = 0
+    skipped_unsupported_lang = 0
 
     for vid, vurl, meta, text in fetched_results:
         clean_text = text.replace("\n", " ").strip()
@@ -445,13 +371,13 @@ def search_and_scrape_youtube(keyword: str, trusted_channels: list, lsh, hash_by
             continue
 
         lang, confidence = detect_language(clean_text)
-        if lang != "en" or confidence < LANGUAGE_MIN_CONFIDENCE:
-            skipped_non_english += 1
+        if lang not in ALLOWED_LANGUAGES or confidence < LANGUAGE_MIN_CONFIDENCE:
+            skipped_unsupported_lang += 1
             continue
 
-        channel_id = meta.get("channel_id")
+        channel_id = meta.get("channel_id") or UNRESOLVED_CHANNEL_ID
         channel_name = meta.get("channel") or "Unknown"
-        record_id = f"YouTube_{channel_id or 'unknown'}_{vid}"
+        record_id = f"YouTube_{channel_id}_{vid}"
 
         if record_id in existing_ids:
             continue
@@ -463,6 +389,8 @@ def search_and_scrape_youtube(keyword: str, trusted_channels: list, lsh, hash_by
         collected_at = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
 
         asset_evidence_text = (str(meta.get("title") or "") + "\n" + clean_text).strip()
+        translated_text, sentiment, asset_mention = analyze_text(
+            clean_text, lang, asset_text=asset_evidence_text, context_terms=context_terms)
 
         record = {
             "record_id": record_id,
@@ -480,14 +408,16 @@ def search_and_scrape_youtube(keyword: str, trusted_channels: list, lsh, hash_by
                 "title": meta.get("title", "N/A"),
                 "raw_text": clean_text,
                 "Clean_text": "",
-                "language": lang
+                "language": lang,
+                "translated_text": translated_text
             },
             "time_stamps": {
                 "published_at": meta.get("upload_datetime", "N/A"),
                 "collected_at": collected_at,
                 "updated_at": meta.get("updated_at")
             },
-            "asset_mention": extract_asset_mentions(asset_evidence_text, context_terms=[keyword]),
+            "asset_mention": asset_mention,
+            "sentiment": sentiment,
             "Engagement": {
                 "Views": meta.get("view_count", 0),
                 "likes": meta.get("like_count", 0),
@@ -507,23 +437,84 @@ def search_and_scrape_youtube(keyword: str, trusted_channels: list, lsh, hash_by
         existing_ids.add(record_id)
         added_count += 1
 
-    if skipped_non_english:
-        logger.info(f"Filtered out {skipped_non_english} non-English video(s) for '{keyword}'.")
+    if skipped_unsupported_lang:
+        logger.info(f"Filtered out {skipped_unsupported_lang} unsupported-language video(s) for '{log_label}'.")
 
     if added_count > 0:
         with open(master_file, 'w', encoding='utf-8') as f:
             json.dump(existing_records, f, indent=4, ensure_ascii=False)
         logger.info(f"Appended {added_count} new sorted videos to {master_file} (Total: {len(existing_records)}).")
     else:
-        logger.info(f"No new unique videos to append for '{keyword}'.")
+        logger.info(f"No new unique videos to append for '{log_label}'.")
 
     return master_file
 
 
-def main():
-    keyword_file = "yt-keywords.txt"
-    channels_file = "yt-channels.txt"
+def search_and_scrape_youtube(keyword: str, trusted_channels: list, lsh, hash_by_id, output_dir: str = "yt-transcripts/"):
+    """Keyword mode: yt-dlp search results scoped to the trusted channels."""
+    os.makedirs(output_dir, exist_ok=True)
+    safe_keyword = keyword.replace(" ", "_").lower()
+    master_file = os.path.join(output_dir, f"youtube_{safe_keyword}.json")
 
+    candidate_ids = search_youtube_videos(keyword, trusted_channels, max_results=MAX_RESULTS_PER_KEYWORD)
+    if not candidate_ids:
+        logger.info(f"No video candidates found for '{keyword}'.")
+        return None
+
+    return _fetch_and_write_videos(candidate_ids, master_file, context_terms=[keyword],
+                                   lsh=lsh, hash_by_id=hash_by_id, log_label=keyword)
+
+
+def scrape_channel_videos(channel_name: str, lsh, hash_by_id, output_dir: str = "yt-transcripts/"):
+    """
+    Account-only mode: every recent upload from one trusted channel, no
+    keyword filtering or candidate ranking. Relevance is left entirely to
+    the asset-mapping stage.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    channel_id, resolved_name = resolve_channel_id(channel_name)
+    if not channel_id:
+        logger.error(f"Could not resolve a channel ID for '{channel_name}'. Skipping.")
+        return None
+
+    safe_name = channel_name.replace(" ", "_").lower()
+    master_file = os.path.join(output_dir, f"youtube_{safe_name}.json")
+
+    candidate_ids = list_channel_uploads(channel_id, max_results=MAX_VIDEOS_PER_CHANNEL)
+    if not candidate_ids:
+        logger.info(f"No recent uploads found for '{resolved_name or channel_name}'.")
+        return None
+
+    return _fetch_and_write_videos(candidate_ids, master_file, context_terms=[],
+                                   lsh=lsh, hash_by_id=hash_by_id,
+                                   log_label=resolved_name or channel_name)
+
+
+def main():
+    channels_file = "yt-channels.txt"
+    trusted_channels = load_trusted_channels(channels_file)
+    logger.info(f"Loaded {len(trusted_channels)} trusted channels from {channels_file}.")
+
+    mode = get_scrape_mode(logger, prefix="YT")
+
+    # Pre-load Whisper model once at startup
+    get_whisper_model(logger)
+
+    run_timestamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    logger.info(f"Starting scraping run {run_timestamp} for YouTube videos in '{mode}' mode...")
+
+    lsh, hash_by_id = dedup_utils.load_lsh()
+
+    if mode == "accounts":
+        for channel in trusted_channels:
+            try:
+                scrape_channel_videos(channel, lsh, hash_by_id)
+            except Exception as e:
+                logger.error(f"Error scraping channel '{channel}': {str(e).splitlines()[0]}")
+        logger.info("Scraping for all trusted channels is done.")
+        return
+
+    keyword_file = "yt-keywords.txt"
     if not os.path.exists(keyword_file):
         logger.error(f"File '{keyword_file}' not found.")
         return
@@ -534,17 +525,6 @@ def main():
     if not keywords:
         logger.error(f"No keywords found in '{keyword_file}'.")
         return
-
-    trusted_channels = load_trusted_channels(channels_file)
-    logger.info(f"Loaded {len(trusted_channels)} trusted channels from {channels_file}.")
-
-    # Pre-load Whisper model once at startup
-    get_whisper_model()
-
-    run_timestamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-    logger.info(f"Starting scraping run {run_timestamp} for YouTube videos...")
-
-    lsh, hash_by_id = dedup_utils.load_lsh()
 
     for keyword in keywords:
         try:

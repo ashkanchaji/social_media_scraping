@@ -11,19 +11,152 @@ Install: pip install py3langid --break-system-packages
 
 import os
 import re
+import sys
 import json
 import time
 import random
 import logging
+import tempfile
+import bisect
 import functools
 import threading
 import datetime
+import warnings
 from logging.handlers import RotatingFileHandler
 from urllib.parse import urlparse, parse_qs
 
+from dotenv import load_dotenv
 from py3langid.langid import LanguageIdentifier, MODEL_FILE
 
+# Every scraper imports this module, so loading .env here (once) makes
+# TELEGRAM_API_ID, REDDIT_CLIENT_ID, TRUTHSOCIAL_PASSWORD, etc. available to
+# all of them without each script needing its own load_dotenv() call.
+# Real shell exports still take precedence -- load_dotenv() never overwrites
+# a variable that's already set in the environment.
+load_dotenv()
+
+# Third-party chatter that is not actionable for an operator reading a scraper
+# log: transformers announces every pipeline's device and warns about long
+# inputs it already truncates, marian asks for sacremoses, and Telethon logs
+# routine reconnects. Set before transformers is ever imported (every import of
+# it in this module is lazy), and with setdefault so an operator debugging a
+# model can still export TRANSFORMERS_VERBOSITY=warning.
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+warnings.filterwarnings("ignore", message=".*sacremoses.*")
+logging.getLogger("telethon").setLevel(logging.ERROR)
+
 _identifier = LanguageIdentifier.from_pickled_model(MODEL_FILE, norm_probs=True)
+
+
+# ---------------------------------------------------------------------------
+# Environment-driven configuration
+#
+# Every tunable scraper constant is declared as ``X = env_int("X", default)``
+# so an operator who has never read the code can retune a run from .env alone
+# (12-factor config), while the in-code default keeps a bare checkout working
+# with no .env at all. Each helper looks up "<PREFIX>_<NAME>" first and then
+# the bare "<NAME>", so a value can be set once for every scraper and still be
+# overridden for one of them (e.g. MAX_PAST_MINUTES=60 with YT_MAX_PAST_MINUTES=1440).
+# A malformed value logs a warning and falls back to the default rather than
+# killing an unattended cron run.
+# ---------------------------------------------------------------------------
+
+def _env_raw(name: str, prefix: str = ""):
+    for key in ([f"{prefix}_{name}"] if prefix else []) + [name]:
+        value = os.environ.get(key)
+        if value is not None and value.strip():
+            return key, value.strip()
+    return None, None
+
+
+def _env_parsed(name: str, default, prefix: str, parse):
+    key, value = _env_raw(name, prefix)
+    if value is None:
+        return default
+    try:
+        return parse(value)
+    except (TypeError, ValueError) as e:
+        logging.getLogger(__name__).warning(
+            "Invalid value for %s (%r): %s. Using default %r.", key, value, e, default
+        )
+        return default
+
+
+def env_str(name: str, default: str = "", prefix: str = "") -> str:
+    return _env_parsed(name, default, prefix, str)
+
+
+def env_int(name: str, default: int, prefix: str = "") -> int:
+    return _env_parsed(name, default, prefix, lambda v: int(float(v)))
+
+
+def env_float(name: str, default: float, prefix: str = "") -> float:
+    return _env_parsed(name, default, prefix, float)
+
+
+def env_bool(name: str, default: bool, prefix: str = "") -> bool:
+    def parse(value):
+        lowered = value.casefold()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+        raise ValueError("expected a boolean like true/false")
+    return _env_parsed(name, default, prefix, parse)
+
+
+def env_set(name: str, default: set, prefix: str = "") -> set:
+    """Comma-separated list -> set of lowercased items (e.g. ALLOWED_LANGUAGES=en,fa)."""
+    return _env_parsed(
+        name, default, prefix,
+        lambda v: {item.strip().casefold() for item in v.split(",") if item.strip()},
+    )
+
+
+def env_range(name: str, default: tuple, prefix: str = "") -> tuple:
+    """"min,max" -> (float, float), used for the jittered pacing delays."""
+    def parse(value):
+        parts = [float(p) for p in value.split(",")]
+        if len(parts) != 2 or parts[0] > parts[1]:
+            raise ValueError("expected 'min,max' with min <= max")
+        return (parts[0], parts[1])
+    return _env_parsed(name, default, prefix, parse)
+
+
+def get_scrape_mode(logger=None, prefix: str = "") -> str:
+    """Returns "keyword" or "accounts" for this run.
+
+    Read from SCRAPE_MODE (or <PREFIX>_SCRAPE_MODE) so a cron/bash wrapper can
+    pick the discovery method with no terminal input. Only an interactive
+    terminal falls back to asking; a non-interactive run with no variable set
+    uses "keyword", which is the historical behaviour of every scraper that
+    has keywords.
+    """
+    log = logger or logging.getLogger(__name__)
+    key, value = _env_raw("SCRAPE_MODE", prefix)
+    if value:
+        mode = value.casefold()
+        aliases = {"keyword": "keyword", "keywords": "keyword",
+                   "accounts": "accounts", "account": "accounts", "channels": "accounts"}
+        if mode in aliases:
+            log.info(f"{key}={mode} set in environment; skipping interactive prompt.")
+            return aliases[mode]
+        log.warning(f"Unrecognised {key}={value!r}; expected 'keyword' or 'accounts'.")
+
+    if not sys.stdin.isatty():
+        log.info("SCRAPE_MODE not set and no terminal attached; defaulting to 'keyword' mode.")
+        return "keyword"
+
+    while True:
+        choice = input(
+            "Scrape by (1) keyword, prioritizing trusted accounts, or "
+            "(2) trusted accounts only (all recent posts, no keyword)? [1/2]: "
+        ).strip()
+        if choice == "1":
+            return "keyword"
+        if choice == "2":
+            return "accounts"
+        print("Please enter 1 or 2.")
 
 
 # Built-in starter registry. Projects can extend/override this without code
@@ -60,18 +193,64 @@ _DEFAULT_ASSET_REGISTRY = [
     {"canonical_name": "Meta Platforms", "Symbol": "META", "asset_class": "equity", "asset_id": "equity:META", "aliases": ["meta platforms", "meta", "facebook", "meta stock"], "topics": ["social media", "digital advertising", "big tech"], "description": "Meta Platforms Inc. common stock"},
 ]
 
+# Content_type each platform emits. A platform missing from this map fails the
+# content-type check outright instead of silently scoring lower, and the same
+# key set drives the identity/record_id checks below.
+_PLATFORM_CONTENT_TYPES = {
+    "X": "tweet",
+    "YouTube": "video",
+    "Telegram": "message",
+    "Reddit": "post",
+    "TikTok": "video",
+    "TruthSocial": "post",
+}
+_KNOWN_PLATFORMS = frozenset(_PLATFORM_CONTENT_TYPES)
+# Platforms whose posts carry a real title field (as opposed to body text only).
+_TITLED_PLATFORMS = frozenset({"YouTube", "Reddit"})
+
 _CASHTAG_RE = re.compile(r"(?<!\w)\$([A-Za-z][A-Za-z0-9._-]{0,14})\b")
 _ASSET_REGISTRY_CACHE = {}
 _ASSET_REGISTRY_LOCK = threading.Lock()
-_ASSET_NLI_MODEL_NAME = os.environ.get("ASSET_NLI_MODEL", "cross-encoder/nli-deberta-v3-base")
-_ASSET_NLI_DEVICE = os.environ.get("ASSET_NLI_DEVICE", "auto").strip().lower()
-_ASSET_CONTEXT_MAX_RESULTS = int(os.environ.get("ASSET_CONTEXT_MAX_RESULTS", "0"))  # 0 = keep all NLI-entailing context candidates
-_ASSET_NLI_BATCH_SIZE = max(1, int(os.environ.get("ASSET_NLI_BATCH_SIZE", "16")))
+# Same parameter class as the older cross-encoder/nli-deberta-v3-large it
+# replaces, but trained on a much broader NLI mixture (MNLI+FEVER+ANLI+LingNLI
+# +WANLI), so entailment probabilities for the free-form hypotheses
+# _asset_hypothesis builds are both sharper and better calibrated at the same
+# VRAM/latency cost. It must stay a THREE-class model (entailment / neutral /
+# contradiction): the zeroshot-v2.0 family is two-class (entailment /
+# not_entailment) and has no contradiction label, which silently turns the
+# false-positive filter below into a no-op. Swap via ASSET_NLI_MODEL if a
+# machine cannot hold it -- MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli is
+# the same shape, one size down.
+_ASSET_NLI_MODEL_NAME = env_str("ASSET_NLI_MODEL", "MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli")
+_ASSET_NLI_DEVICE = env_str("ASSET_NLI_DEVICE", "auto").strip().lower()
+_ASSET_CONTEXT_MAX_RESULTS = env_int("ASSET_CONTEXT_MAX_RESULTS", 0)  # 0 = keep all NLI-entailing context candidates
+_ASSET_NLI_BATCH_SIZE = max(1, env_int("ASSET_NLI_BATCH_SIZE", 16))
+# A literal alias match that the model actively contradicts is a false
+# positive (e.g. "Shell" the noun, "gold" the colour). Direct mentions below
+# this entailment probability are dropped rather than emitted with a
+# misleadingly low confidence; 0 disables the filter and keeps every match.
+_ASSET_DIRECT_MIN_CONFIDENCE = env_float("ASSET_DIRECT_MIN_CONFIDENCE", 0.10)
 _ASSET_NLI_BUNDLE = None
 _ASSET_NLI_LOCK = threading.Lock()
 _ASSET_CONTEXT_CACHE = {}
 _ASSET_CONTEXT_CACHE_LOCK = threading.Lock()
 _ASSET_MODEL_WARNING_EMITTED = False
+
+# FinBERT sentiment, and Persian->English translation so non-English records
+# still carry an English field for downstream NLP that expects one.
+_SENTIMENT_MODEL_NAME = env_str("SENTIMENT_MODEL", "ProsusAI/finbert")
+_SENTIMENT_BUNDLE = None
+_SENTIMENT_LOCK = threading.Lock()
+_SENTIMENT_WARNING_EMITTED = False
+
+# Helsinki-NLP retired the standalone "opus-mt-fa-en" repo; Persian now lives
+# in this multi-target Iranian-languages model, which requires a sentence
+# initial ">>eng<<" target-language token (added in translate_fa_to_en below).
+_TRANSLATION_MODEL_NAME = env_str("FA_EN_TRANSLATION_MODEL", "Helsinki-NLP/opus-mt-tc-bible-big-ira-deu_eng_fra_por_spa")
+_TRANSLATION_TARGET_TOKEN = ">>eng<< "
+_TRANSLATION_BUNDLE = None
+_TRANSLATION_LOCK = threading.Lock()
+_TRANSLATION_WARNING_EMITTED = False
 
 
 def setup_logging(name: str, log_file: str = "scraper.log") -> logging.Logger:
@@ -164,6 +343,251 @@ def is_english(text: str, min_confidence: float = 0.70) -> bool:
     lang, prob = detect_language(text)
     return lang == "en" and prob >= min_confidence
 
+
+def _load_sentiment_model():
+    """Lazy-loads the FinBERT sentiment pipeline. Returns None if unavailable
+    (missing transformers/torch or a model-download failure) -- callers then
+    store a null sentiment rather than fabricating one."""
+    global _SENTIMENT_BUNDLE, _SENTIMENT_WARNING_EMITTED
+    if _SENTIMENT_BUNDLE is False:
+        return None
+    if _SENTIMENT_BUNDLE is not None:
+        return _SENTIMENT_BUNDLE
+    with _SENTIMENT_LOCK:
+        if _SENTIMENT_BUNDLE is not None:
+            return None if _SENTIMENT_BUNDLE is False else _SENTIMENT_BUNDLE
+        try:
+            from transformers import pipeline
+            _SENTIMENT_BUNDLE = pipeline("sentiment-analysis", model=_SENTIMENT_MODEL_NAME)
+        except Exception as e:
+            _SENTIMENT_BUNDLE = False
+            if not _SENTIMENT_WARNING_EMITTED:
+                logging.getLogger(__name__).warning(
+                    "Sentiment model unavailable (%s). sentiment.label/confidence will be null.",
+                    str(e).splitlines()[0] if str(e) else type(e).__name__,
+                )
+                _SENTIMENT_WARNING_EMITTED = True
+            return None
+    return _SENTIMENT_BUNDLE
+
+
+def analyze_sentiment(text: str) -> dict:
+    """Runs FinBERT sentiment on ``text`` (expected to already be English --
+    callers should pass the translated_text for Persian records).
+
+    Returns {"label": "positive"|"neutral"|"negative", "confidence": 0-1} or
+    {"label": None, "confidence": None} for empty input or when the model is
+    unavailable.
+    """
+    text = (text or "").strip()
+    if not text:
+        return {"label": None, "confidence": None}
+    model = _load_sentiment_model()
+    if not model:
+        return {"label": None, "confidence": None}
+    # FinBERT's input window is 512 tokens, so scoring a long transcript in one
+    # call silently judges the whole video by its opening ~380 words. Chunking
+    # and averaging the per-label probabilities keeps every part of the text in
+    # the verdict; a short post is a single chunk and behaves exactly as before.
+    chunks = _split_nli_premise(text, max_chars=1200, max_chunks=12)
+    if not chunks:
+        return {"label": None, "confidence": None}
+    try:
+        outputs = model(chunks, truncation=True, max_length=512, top_k=None)
+        totals = {}
+        for scores in outputs:
+            for entry in scores:
+                label = str(entry["label"]).lower()
+                totals[label] = totals.get(label, 0.0) + float(entry["score"])
+        if not totals:
+            return {"label": None, "confidence": None}
+        label, total = max(totals.items(), key=lambda kv: kv[1])
+        return {"label": label, "confidence": round(total / len(outputs), 4)}
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            "Sentiment analysis failed: %s", str(e).splitlines()[0] if str(e) else type(e).__name__
+        )
+        return {"label": None, "confidence": None}
+
+
+def _load_translation_model():
+    """Lazy-loads the fa->en translation pipeline. Returns None if unavailable."""
+    global _TRANSLATION_BUNDLE, _TRANSLATION_WARNING_EMITTED
+    if _TRANSLATION_BUNDLE is False:
+        return None
+    if _TRANSLATION_BUNDLE is not None:
+        return _TRANSLATION_BUNDLE
+    with _TRANSLATION_LOCK:
+        if _TRANSLATION_BUNDLE is not None:
+            return None if _TRANSLATION_BUNDLE is False else _TRANSLATION_BUNDLE
+        try:
+            from transformers import pipeline
+            _TRANSLATION_BUNDLE = pipeline("translation", model=_TRANSLATION_MODEL_NAME)
+        except Exception as e:
+            _TRANSLATION_BUNDLE = False
+            if not _TRANSLATION_WARNING_EMITTED:
+                logging.getLogger(__name__).warning(
+                    "Translation model unavailable (%s). Persian records will be stored without translated_text.",
+                    str(e).splitlines()[0] if str(e) else type(e).__name__,
+                )
+                _TRANSLATION_WARNING_EMITTED = True
+            return None
+    return _TRANSLATION_BUNDLE
+
+
+def translate_fa_to_en(text: str) -> str:
+    """Translates Persian text to English, chunked for long transcripts.
+
+    Returns None for empty input or when the model is unavailable -- never
+    a partial/garbled translation.
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    model = _load_translation_model()
+    if not model:
+        return None
+    chunks = _split_nli_premise(text, max_chars=1000, max_chunks=20)
+    if not chunks:
+        return None
+    try:
+        pieces = [
+            model(_TRANSLATION_TARGET_TOKEN + chunk, truncation=True)[0]["translation_text"]
+            for chunk in chunks
+        ]
+        translated = " ".join(p.strip() for p in pieces if p and p.strip()).strip()
+        return translated or None
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            "Translation failed: %s", str(e).splitlines()[0] if str(e) else type(e).__name__
+        )
+        return None
+
+
+def analyze_text(text: str, lang: str, asset_text: str = None, context_terms=None) -> tuple:
+    """Returns (translated_text, sentiment_dict, asset_mention_list) for one record.
+
+    Shared by every scraper so the fa/en handling is identical everywhere:
+
+    * English record -- sentiment and asset extraction run on the text
+      directly and ``translated_text`` stays None.
+    * Persian record -- the text is translated once, then BOTH FinBERT and the
+      asset stage read the translation. FinBERT is English-only, and the asset
+      registry's aliases and the NLI relevance model are English too, so a
+      Persian record scored on its original text would report no assets no
+      matter what it was about. If the translation model is unavailable the
+      original text is still passed through, which keeps cashtags and Latin
+      symbols matchable.
+
+    ``asset_text`` lets a scraper widen the asset input beyond the record's
+    raw_text (Reddit adds the title, TikTok the video description); it defaults
+    to ``text``.
+    """
+    asset_text = text if asset_text is None else asset_text
+    if lang != "fa":
+        return None, analyze_sentiment(text), extract_asset_mentions(asset_text, context_terms=context_terms)
+
+    translated = translate_fa_to_en(text)
+    sentiment = analyze_sentiment(translated) if translated else {"label": None, "confidence": None}
+    asset_source = translated if asset_text == text else translate_fa_to_en(asset_text)
+    assets = extract_asset_mentions(asset_source or asset_text, context_terms=context_terms)
+    return translated, sentiment, assets
+
+
+
+TIMESTAMP_FMT = "%Y-%m-%d %H:%M:%S UTC"
+
+
+def parse_record_timestamp(value):
+    """Parses a stored published_at string back into a datetime for sorting."""
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        return datetime.datetime.strptime(value, TIMESTAMP_FMT).replace(tzinfo=datetime.timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
+class RecordFile:
+    """One output JSON file, loaded on demand and kept sorted by published_at.
+
+    Exists because keyword mode on the account-driven platforms (TikTok, Truth
+    Social) walks accounts once but routes each post into the file of whichever
+    keyword it matched, so a single pass has several output files open at the
+    same time. Appending never overwrites prior runs: existing records are read
+    back in, new ones are inserted in chronological position, and the file is
+    only rewritten if something was actually added.
+    """
+
+    def __init__(self, path: str, logger=None):
+        self.path = path
+        self._logger = logger or logging.getLogger(__name__)
+        self.records = []
+        self.ids = set()
+        self._sort_keys = []
+        self.added = 0
+        self._loaded = False
+
+    def _load(self):
+        if self._loaded:
+            return
+        self._loaded = True
+        if not os.path.exists(self.path):
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                self.records = json.load(f)
+        except Exception as e:
+            self._logger.error(f"Error loading {self.path}: {e}")
+            self.records = []
+            return
+        for record in self.records:
+            record_id = record.get("record_id")
+            if record_id:
+                self.ids.add(record_id)
+            parsed = parse_record_timestamp((record.get("time_stamps") or {}).get("published_at"))
+            self._sort_keys.append(parsed.timestamp() if parsed else 0.0)
+
+    def has(self, record_id: str) -> bool:
+        self._load()
+        return record_id in self.ids
+
+    def add(self, record: dict, published_dt=None):
+        self._load()
+        sort_key = published_dt.timestamp() if published_dt else 0.0
+        index = bisect.bisect_right(self._sort_keys, sort_key)
+        self.records.insert(index, record)
+        self._sort_keys.insert(index, sort_key)
+        record_id = record.get("record_id")
+        if record_id:
+            self.ids.add(record_id)
+        self.added += 1
+
+    def save(self) -> bool:
+        """Writes the file if anything was added. Returns whether it wrote."""
+        if not self.added:
+            return False
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(self.records, f, indent=4, ensure_ascii=False)
+        self._logger.info(
+            f"Appended {self.added} new sorted records to {self.path} (Total: {len(self.records)})."
+        )
+        return True
+
+
+def keyword_matches(text: str, keyword: str) -> bool:
+    """True when every whitespace-separated token of ``keyword`` occurs in ``text``.
+
+    Used by the keyword mode of the account-driven platforms, which have no
+    free search API and so filter the trusted accounts' own posts instead of
+    querying a search endpoint. Token-wise rather than whole-phrase matching so
+    "oil prices" still matches "prices of oil"; case-insensitive and script
+    agnostic, so it works the same on Persian text as on English.
+    """
+    haystack = (text or "").casefold()
+    tokens = (keyword or "").casefold().split()
+    return bool(tokens) and all(token in haystack for token in tokens)
 
 
 def _normalized_asset_entry(entry: dict) -> dict:
@@ -292,9 +716,13 @@ def _load_asset_nli_model():
             model.eval()
 
             id2label = {int(k): str(v).lower() for k, v in (model.config.id2label or {}).items()}
-            entail_idx = next((i for i, label in id2label.items() if "entail" in label), 1)
-            contradiction_idx = next((i for i, label in id2label.items() if "contrad" in label), 0)
-            neutral_idx = next((i for i, label in id2label.items() if "neutral" in label), 2)
+            # "not_entailment" also contains "entail", so match the prefix, not
+            # the substring. A model that exposes no contradiction/neutral
+            # class leaves those None rather than aliasing them onto index 0/2,
+            # which would mislabel its predictions.
+            entail_idx = next((i for i, label in id2label.items() if label.startswith("entail")), 1)
+            contradiction_idx = next((i for i, label in id2label.items() if "contrad" in label), None)
+            neutral_idx = next((i for i, label in id2label.items() if label == "neutral"), None)
             _ASSET_NLI_BUNDLE = (tokenizer, model, torch, device, entail_idx, contradiction_idx, neutral_idx)
         except Exception as e:
             _ASSET_NLI_BUNDLE = False
@@ -307,6 +735,29 @@ def _load_asset_nli_model():
                 _ASSET_MODEL_WARNING_EMITTED = True
             return None
     return _ASSET_NLI_BUNDLE
+
+
+def _demote_nli_to_cpu(reason: str):
+    """Moves the loaded NLI model to CPU for the rest of this process.
+
+    VRAM is shared: a second scraper started by hand (or a long batch) can
+    exhaust it mid-run, and an uncaught CUDA OOM here loses every record of
+    the keyword/account being processed, not just one asset score. Same
+    trade-off the Whisper circuit breaker already makes -- slower, but the
+    run keeps producing records.
+    """
+    global _ASSET_NLI_BUNDLE
+    tokenizer, model, torch, device, *rest = _ASSET_NLI_BUNDLE
+    if device.type == "cpu":
+        return device
+    cpu = torch.device("cpu")
+    model.to(cpu)
+    torch.cuda.empty_cache()
+    _ASSET_NLI_BUNDLE = (tokenizer, model, torch, cpu, *rest)
+    logging.getLogger(__name__).warning(
+        "Asset NLI model moved to CPU after CUDA OOM (%s). Scoring continues on CPU.", reason
+    )
+    return cpu
 
 
 def _split_nli_premise(text: str, max_chars: int = 1400, max_chunks: int = 12) -> list:
@@ -387,19 +838,22 @@ def _nli_asset_scores(premise: str, entries: list) -> dict:
                 max_length=512,
                 return_tensors="pt",
             )
-            encoded = {k: v.to(device) for k, v in encoded.items()}
-            logits = model(**encoded).logits
+            try:
+                logits = model(**{k: v.to(device) for k, v in encoded.items()}).logits
+            except torch.cuda.OutOfMemoryError as e:
+                device = _demote_nli_to_cpu(str(e).splitlines()[0])
+                logits = model(**{k: v.to(device) for k, v in encoded.items()}).logits
             probs = torch.softmax(logits, dim=-1).detach().cpu()
             pred = probs.argmax(dim=-1).tolist()
             for entry, row, pred_idx in zip(batch_entries, probs, pred):
                 if pred_idx == entail_idx:
                     label = "entailment"
-                elif pred_idx == contradiction_idx:
+                elif contradiction_idx is not None and pred_idx == contradiction_idx:
                     label = "contradiction"
-                elif pred_idx == neutral_idx:
+                elif neutral_idx is not None and pred_idx == neutral_idx:
                     label = "neutral"
                 else:
-                    label = str(pred_idx)
+                    label = "not_entailment"
                 key = entry.get("asset_id") or entry.get("Symbol") or entry.get("canonical_name")
                 candidate = {"entailment": float(row[entail_idx].item()), "label": label}
                 current = out.get(key)
@@ -505,6 +959,21 @@ def extract_asset_mentions(text: str, context_terms=None, registry_path: str = "
             # A literal mention is a fact; relevance confidence comes only from
             # the model's entailment probability for the actual record text.
             confidence = text_score["entailment"] if text_score else None
+            # A word can match an alias without the content being about the
+            # asset ("Shell" the noun, "gold" the colour). When the model
+            # actively contradicts the relevance claim and its entailment
+            # probability is negligible, that is a false positive, not a
+            # low-confidence hit -- emitting it would pollute downstream
+            # asset joins with mentions the model already rejected.
+            # Deliberately requires an explicit "contradiction": a merely
+            # neutral verdict means the model is unsure, and dropping those
+            # would discard real mentions the model simply could not confirm.
+            if (
+                text_score
+                and text_score["label"] == "contradiction"
+                and confidence < _ASSET_DIRECT_MIN_CONFIDENCE
+            ):
+                continue
         else:
             # Context-only inference is emitted only if BOTH the search topic
             # and the record text are independently classified as entailment.
@@ -546,6 +1015,13 @@ def _valid_source_id(platform: str, value) -> bool:
         return bool(re.fullmatch(r"[A-Za-z0-9_-]{11}", value))
     if platform == "Telegram":
         return bool(re.fullmatch(r"\d+", value))
+    if platform == "Reddit":
+        # Reddit submission IDs are base36, without the "t3_" type prefix.
+        return bool(re.fullmatch(r"[a-z0-9]{4,13}", value))
+    if platform == "TikTok":
+        return bool(re.fullmatch(r"\d{6,25}", value))
+    if platform == "TruthSocial":
+        return bool(re.fullmatch(r"\d+", value))
     return bool(value and value.lower() not in {"n/a", "unknown", "none", "null"})
 
 
@@ -559,6 +1035,15 @@ def _valid_author_id(platform: str, value) -> bool:
     if platform == "Telegram":
         # Public Telegram usernames are 5-32 alphanumeric/underscore characters.
         return bool(re.fullmatch(r"[A-Za-z0-9_]{5,32}", value))
+    if platform == "Reddit":
+        # The subreddit is the trusted source, so it plays the author role
+        # here the same way a channel does for Telegram/YouTube.
+        return bool(re.fullmatch(r"[A-Za-z0-9_]{3,21}", value))
+    if platform == "TikTok":
+        # TikTok usernames allow dots as well as letters/digits/underscores.
+        return bool(re.fullmatch(r"[A-Za-z0-9_.]{1,24}", value))
+    if platform == "TruthSocial":
+        return bool(re.fullmatch(r"[A-Za-z0-9_]{1,30}", value))
     return bool(value and value.lower() not in {"n/a", "unknown", "none", "null"})
 
 
@@ -594,6 +1079,42 @@ def _valid_source_url(platform: str, url, author_id=None, source_id=None) -> boo
         else:
             return False
         return bool(found_id and (not source_id or found_id == str(source_id)))
+
+    if platform == "Reddit":
+        if host not in {"reddit.com", "www.reddit.com", "old.reddit.com", "new.reddit.com"}:
+            return False
+        m = re.match(r"/r/([A-Za-z0-9_]{3,21})/comments/([a-z0-9]{4,13})(?:/|$)", parsed.path)
+        if not m:
+            return False
+        if author_id and m.group(1).casefold() != str(author_id).lstrip("@").casefold():
+            return False
+        if source_id and m.group(2) != str(source_id):
+            return False
+        return True
+
+    if platform == "TikTok":
+        if host not in {"tiktok.com", "www.tiktok.com", "m.tiktok.com"}:
+            return False
+        m = re.fullmatch(r"/@([A-Za-z0-9_.]{1,24})/video/(\d{6,25})/?", parsed.path)
+        if not m:
+            return False
+        if author_id and m.group(1).casefold() != str(author_id).lstrip("@").casefold():
+            return False
+        if source_id and m.group(2) != str(source_id):
+            return False
+        return True
+
+    if platform == "TruthSocial":
+        if host not in {"truthsocial.com", "www.truthsocial.com"}:
+            return False
+        m = re.fullmatch(r"/@([A-Za-z0-9_]{1,30})/(?:posts/)?(\d+)/?", parsed.path)
+        if not m:
+            return False
+        if author_id and m.group(1).casefold() != str(author_id).lstrip("@").casefold():
+            return False
+        if source_id and m.group(2) != str(source_id):
+            return False
+        return True
 
     if platform == "Telegram":
         if host not in {"t.me", "www.t.me"}:
@@ -639,12 +1160,8 @@ def _record_id_consistent(record: dict) -> bool:
     record_id = str(record.get("record_id") or "")
     author_id = str(source.get("author_id") or "").lstrip("@")
     source_id = str(source.get("Source_id") or "")
-    if platform == "X":
-        return record_id == f"X_{author_id}_{source_id}"
-    if platform == "YouTube":
-        return record_id == f"YouTube_{author_id}_{source_id}"
-    if platform == "Telegram":
-        return record_id == f"Telegram_{author_id}_{source_id}"
+    if platform in _KNOWN_PLATFORMS:
+        return record_id == f"{platform}_{author_id}_{source_id}"
     return bool(record_id)
 
 
@@ -676,6 +1193,9 @@ def _media_checks(record: dict) -> list:
             checks.append(("consistent_youtube_media_url", media.get("media_url") == source.get("url")))
         if source.get("platform") == "Telegram":
             checks.append(("consistent_telegram_media_url", media.get("media_url") == source.get("url")))
+        if source.get("platform") == "TikTok":
+            checks.append(("consistent_tiktok_media_type", media.get("media_type") == "video"))
+            checks.append(("consistent_tiktok_media_url", media.get("media_url") == source.get("url")))
     elif has_media is False:
         checks.append(("valid_media_type", media.get("media_type") is None))
         checks.append(("valid_media_url", media.get("media_url") is None))
@@ -720,7 +1240,15 @@ def _asset_checks(record: dict) -> list:
             continue
         resolved = bool(item.get("canonical_name") and item.get("Symbol") and item.get("asset_class") and item.get("asset_id"))
         confidence = item.get("confidence")
-        confidence_ok = isinstance(confidence, (int, float)) and not isinstance(confidence, bool) and 0.0 <= float(confidence) <= 1.0
+        # ``confidence is None`` is the documented degraded mode of
+        # _load_asset_nli_model (model/deps unavailable), not a defect in this
+        # record -- an environment condition must not mark every asset-bearing
+        # record incomplete. A present value still has to be in range.
+        confidence_ok = confidence is None or (
+            isinstance(confidence, (int, float))
+            and not isinstance(confidence, bool)
+            and 0.0 <= float(confidence) <= 1.0
+        )
         # An unresolved cashtag is still a valid observed mention, but the
         # resolution/confidence checks expose that it is not a complete asset mapping.
         checks.append((f"asset_{idx}_observed", bool(item.get("mentioned_text") or resolved)))
@@ -729,10 +1257,62 @@ def _asset_checks(record: dict) -> list:
     return checks
 
 
+def _sentiment_checks(record: dict) -> list:
+    sentiment = record.get("sentiment")
+    if not isinstance(sentiment, dict):
+        return [("valid_sentiment", False)]
+    label = sentiment.get("label")
+    confidence = sentiment.get("confidence")
+    # label=None/confidence=None is the documented degraded mode of
+    # analyze_sentiment (model unavailable), the same rule already applied to
+    # asset confidence -- an environment condition, not a defect in this record.
+    if label is None and confidence is None:
+        return [("valid_sentiment", True)]
+    return [(
+        "valid_sentiment",
+        label in {"positive", "neutral", "negative"}
+        and isinstance(confidence, (int, float))
+        and not isinstance(confidence, bool)
+        and 0.0 <= float(confidence) <= 1.0,
+    )]
+
+
+def _sentiment_category_score(record: dict, checks: list) -> float:
+    """Mirrors _asset_category_score: the boolean check and the model's own
+    confidence value have equal standing, and a null (model-unavailable)
+    sentiment stays a perfect score in this dimension."""
+    sentiment = record.get("sentiment") if isinstance(record.get("sentiment"), dict) else {}
+    confidence = sentiment.get("confidence")
+    values = [100.0 if passed else 0.0 for _, passed in checks]
+    if sentiment.get("label") is not None and isinstance(confidence, (int, float)) and not isinstance(confidence, bool):
+        values.append(max(0.0, min(1.0, float(confidence))) * 100.0)
+    return sum(values) / len(values) if values else 100.0
+
+
 def _category_score(checks: list) -> float:
     if not checks:
         return 100.0
     return 100.0 * sum(1 for _, passed in checks if passed) / len(checks)
+
+
+def _extraction_category_score(checks: list, reliability=None) -> float:
+    """Score extraction quality from boolean checks plus optional reliability.
+
+    Reliability is folded into this dimension rather than appended as a
+    dimension of its own, and a platform that does not report it counts as
+    fully reliable. Both parts are needed for the score to mean the same thing
+    everywhere: otherwise a platform that reports reliability is scored over a
+    different number of values than one that does not, and two records with
+    identical defects get different scores purely because of which scraper
+    produced them.
+    """
+    values = [100.0 if passed else 0.0 for _, passed in checks]
+    try:
+        rel = 1.0 if reliability is None else max(0.0, min(1.0, float(reliability)))
+    except (TypeError, ValueError):
+        rel = 1.0
+    values.append(rel * 100.0)
+    return sum(values) / len(values) if values else 100.0
 
 
 def _asset_category_score(record: dict, checks: list) -> float:
@@ -798,7 +1378,7 @@ def build_quality(
     )
 
     identity = [
-        ("valid_platform", platform in {"X", "YouTube", "Telegram"}),
+        ("valid_platform", platform in _KNOWN_PLATFORMS),
         ("valid_source_type", source.get("Source_type") == "Social_media"),
         ("valid_source_id", _valid_source_id(platform, source.get("Source_id"))),
         ("valid_author_id", _valid_author_id(platform, source.get("author_id"))),
@@ -809,14 +1389,24 @@ def build_quality(
         ("consistent_record_id", _record_id_consistent(record)),
     ]
 
-    expected_type = {"X": "tweet", "YouTube": "video", "Telegram": "message"}.get(platform)
+    expected_type = _PLATFORM_CONTENT_TYPES.get(platform)
     content_checks = [
         ("complete_raw_text", bool(complete_raw_text and isinstance(content.get("raw_text"), str) and content.get("raw_text").strip())),
         ("valid_content_type", bool(expected_type and content.get("Content_type") == expected_type)),
         ("valid_language", bool(content.get("language") and content.get("language") not in {"unknown", "N/A"})),
     ]
-    if platform == "YouTube":
+    if platform in _TITLED_PLATFORMS:
         content_checks.append(("valid_title", bool(str(content.get("title") or "").strip()) and content.get("title") != "N/A"))
+    # translated_text is required only for Persian records; for everything
+    # else it must stay None (same null-means-not-applicable rule as
+    # time_stamps.updated_at). A Persian record with translated_text=None is
+    # still valid -- the translation model may simply be unavailable in this
+    # environment, which is not this record's defect.
+    translated_text = content.get("translated_text")
+    if content.get("language") == "fa":
+        content_checks.append(("valid_translation", translated_text is None or (isinstance(translated_text, str) and bool(translated_text.strip()))))
+    else:
+        content_checks.append(("valid_translation", translated_text is None))
 
     timestamp_checks = [
         ("valid_published_at", published is not None),
@@ -826,6 +1416,7 @@ def build_quality(
     ]
 
     asset_checks = _asset_checks(record)
+    sentiment_checks = _sentiment_checks(record)
     extraction_checks = [
         ("extraction_has_text", isinstance(content.get("raw_text"), str) and bool(content.get("raw_text").strip())),
         ("extraction_complete", bool(complete_raw_text)),
@@ -839,18 +1430,19 @@ def build_quality(
         "engagement_media": _engagement_checks(record) + _media_checks(record),
         "deduplication": _dedup_checks(record),
         "assets": asset_checks,
+        "sentiment": sentiment_checks,
     }
 
-    scores = [
-        _asset_category_score(record, checks) if name == "assets" else _category_score(checks)
-        for name, checks in categories.items()
-    ]
-    if extraction_reliability is not None:
-        try:
-            rel = max(0.0, min(1.0, float(extraction_reliability)))
-            scores.append(rel * 100.0)
-        except (TypeError, ValueError):
-            pass
+    scores = []
+    for name, checks in categories.items():
+        if name == "assets":
+            scores.append(_asset_category_score(record, checks))
+        elif name == "sentiment":
+            scores.append(_sentiment_category_score(record, checks))
+        elif name == "extraction":
+            scores.append(_extraction_category_score(checks, extraction_reliability))
+        else:
+            scores.append(_category_score(checks))
 
     if any(score <= 0 for score in scores):
         quality_score = 0.0
@@ -871,3 +1463,174 @@ def build_quality(
         "quality_score": quality_score,
     }
 
+
+# ---------------------------------------------------------------------------
+# Whisper audio transcription
+#
+# Shared by every scraper whose platform serves video/audio (YouTube, TikTok):
+# the model is expensive to load and the circuit breaker below is only
+# meaningful if all of them count failures against the same state, so this
+# lives here rather than being duplicated per scraper.
+# ---------------------------------------------------------------------------
+
+# "base.en" is English-only and will hallucinate fluent-sounding but
+# meaningless English text when given non-English audio (it has no notion
+# of any other language, so it just pattern-matches sounds to English
+# words). Using a multilingual model + task="translate" (below) instead
+# lets Whisper auto-detect the spoken language and translate it to English
+# properly, matching the quality of YouTube's own auto-translate captions.
+# "small" is a reasonable speed/quality balance for an RTX 3070; bump to
+# "medium" if translation quality on non-English sources still looks weak.
+WHISPER_MODEL_SIZE = env_str("WHISPER_MODEL_SIZE", "small")
+
+_whisper_model = None
+_model_lock = threading.Lock()
+
+# Circuit breaker: if the local Whisper backend is broken (e.g. a CUDA-enabled
+# ctranslate2 wheel that still tries to dlopen libcublas even in CPU mode),
+# don't keep burning minutes downloading audio for every video only to fail
+# at transcribe time. After a few consecutive library-load failures, disable
+# Whisper for the rest of the run and fall back to subtitle-only mode.
+_WHISPER_FAILURE_LIMIT = 3
+_whisper_failure_count = 0
+_whisper_disabled = False
+_whisper_state_lock = threading.Lock()
+
+# Substrings that indicate an environment/library problem (not a per-video
+# problem) -- e.g. "Library libcublas.so.12 is not found or cannot be loaded".
+_ENV_FAILURE_MARKERS = ("libcublas", "libcudnn", "cannot be loaded", "cuda")
+
+
+def _whisper_logger(logger):
+    return logger if logger is not None else logging.getLogger(__name__)
+
+
+def get_whisper_model(logger=None):
+    """Lazily loads and caches the faster-whisper model."""
+    global _whisper_model
+    log = _whisper_logger(logger)
+    with _model_lock:
+        if _whisper_model is None:
+            try:
+                from faster_whisper import WhisperModel
+                log.info(f"Initializing faster-whisper model ({WHISPER_MODEL_SIZE})... (this may take a moment on first run)")
+                try:
+                    _whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cuda", compute_type="float16")
+                    log.info(f"faster-whisper model ({WHISPER_MODEL_SIZE}) successfully loaded and ready (GPU/CUDA).")
+                except Exception as gpu_err:
+                    log.warning(
+                        f"Could not initialize Whisper on GPU ({str(gpu_err).splitlines()[0]}). "
+                        "Falling back to CPU (int8)."
+                    )
+                    _whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
+                    log.info(f"faster-whisper model ({WHISPER_MODEL_SIZE}) successfully loaded and ready (CPU fallback).")
+            except ImportError:
+                log.warning("faster-whisper is not installed. Falling back strictly to subtitle scraping.")
+                _whisper_model = False
+    return _whisper_model
+
+
+def _record_whisper_env_failure(error_text: str, logger=None) -> bool:
+    """Tracks consecutive environment-level Whisper failures (missing CUDA
+    libs, etc). Returns True once the failure limit is hit and Whisper has
+    been disabled for the rest of this run."""
+    global _whisper_failure_count, _whisper_disabled
+    lowered = error_text.lower()
+    if not any(marker in lowered for marker in _ENV_FAILURE_MARKERS):
+        return False
+
+    with _whisper_state_lock:
+        if _whisper_disabled:
+            return True
+        _whisper_failure_count += 1
+        if _whisper_failure_count >= _WHISPER_FAILURE_LIMIT:
+            _whisper_disabled = True
+            _whisper_logger(logger).error(
+                f"Whisper failed {_whisper_failure_count} times in a row with an "
+                f"environment/library error ('{error_text}'). Disabling audio "
+                "transcription for the rest of this run and falling back to "
+                "subtitle-only mode. Fix: reinstall a CPU-only ctranslate2 build, "
+                "or run `pip install nvidia-cublas-cu12 nvidia-cudnn-cu12 "
+                "--break-system-packages` and point LD_LIBRARY_PATH at the "
+                "installed nvidia/*/lib directories before the next run."
+            )
+            return True
+    return False
+
+
+@with_retry(max_attempts=2, base_delay=3.0, exceptions=(Exception,))
+def _download_audio(media_url: str, out_template: str, extra_opts: dict = None) -> None:
+    import yt_dlp
+
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'outtmpl': out_template,
+        'quiet': True,
+        'no_warnings': True,
+        'noprogress': True,
+        'socket_timeout': 25,
+        'retries': 3,
+        'fragment_retries': 3,
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '128',
+        }],
+    }
+    ydl_opts.update(extra_opts or {})
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([media_url])
+
+
+def transcribe_audio(media_url: str, media_id: str, duration: int = 0,
+                     max_duration: int = 0, extra_opts: dict = None, logger=None) -> str:
+    """
+    Downloads a post's audio track and returns an English transcript, or None.
+
+    ``max_duration`` (seconds, 0 disables) skips anything longer, so a 24/7
+    live broadcast can never stall a run on an unbounded download.
+    """
+    log = _whisper_logger(logger)
+    if max_duration and duration and duration > max_duration:
+        log.info(f"Skipping audio download for {media_id}: duration ({duration}s) exceeds {max_duration}s cap.")
+        return None
+
+    model = get_whisper_model(logger)
+    if not model or _whisper_disabled:
+        return None
+
+    log.info(f"Downloading lightweight audio for {media_id}...")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_template = os.path.join(tmpdir, f"{media_id}.%(ext)s")
+
+        try:
+            _download_audio(media_url, out_template, extra_opts)
+
+            audio_file = os.path.join(tmpdir, f"{media_id}.mp3")
+            if not os.path.exists(audio_file):
+                files = os.listdir(tmpdir)
+                if not files:
+                    return None
+                audio_file = os.path.join(tmpdir, files[0])
+
+            log.info(f"Transcribing audio for {media_id} with Whisper...")
+            start_t = time.time()
+            # task="translate" makes Whisper auto-detect the spoken language
+            # and translate it directly to English, instead of transcribing
+            # verbatim in whatever language is detected. Combined with a
+            # multilingual model (not "*.en"), this is what actually handles
+            # non-English source audio correctly.
+            segments, info = model.transcribe(audio_file, beam_size=2, task="translate")
+            transcript_text = " ".join([seg.text.strip() for seg in segments])
+            elapsed = time.time() - start_t
+            log.info(
+                f"Finished transcribing {media_id} in {elapsed:.1f}s "
+                f"({len(transcript_text.split())} words, detected source language: {info.language})."
+            )
+            return transcript_text if transcript_text.strip() else None
+
+        except Exception as e:
+            err_text = str(e).splitlines()[0] if str(e) else type(e).__name__
+            log.warning(f"Audio transcription failed for {media_id}: {err_text}")
+            _record_whisper_env_failure(err_text, logger)
+            return None

@@ -1,6 +1,6 @@
 # --- yt-scraper.py ---
 youtube-transcript-api==1.2.4
-yt-dlp==2026.7.4
+yt-dlp==2026.8.19
 faster-whisper
 
 # GPU transcription support for faster-whisper (ctranslate2 backend).
@@ -14,6 +14,16 @@ x-tweet-fetcher
 
 # --- tel-scraper.py ---
 telethon>=1.36,<2
+sacremoses
+
+# --- reddit-scraper.py ---
+praw>=7.7,<8
+
+# --- tiktok-scraper.py ---
+# Reuses yt-dlp + faster-whisper from the yt-scraper.py block above.
+
+# --- truth-scraper.py ---
+# Truth Social is a Mastodon fork reached over plain HTTP; stdlib only.
 
 # --- dedup_utils.py ---
 numpy==2.5.2
@@ -21,9 +31,18 @@ datasketch
 
 # --- pipeline_utils.py ---
 py3langid
-# --- semantic asset relevance (shared by X + YouTube + Telegram) ---
-# Uses a compact NLI model (cross-encoder/nli-deberta-v3-base by default)
-# to derive asset relevance confidence from model entailment probabilities.
+python-dotenv
+# --- semantic asset relevance, FinBERT sentiment, and fa->en translation
+# (shared by every scraper) ---
+# ASSET_NLI_MODEL (MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli
+# by default, and it must stay a three-class NLI model) derives asset
+# relevance confidence from entailment probabilities;
+# SENTIMENT_MODEL (ProsusAI/finbert) scores positive/neutral/negative
+# sentiment; and FA_EN_TRANSLATION_MODEL (an opus-mt Iranian-languages model)
+# translates Persian records to English. All three are transformers models,
+# downloaded on first use and cached by huggingface_hub -- no extra packages
+# beyond what's already here. Every model name is overridable from .env
+# (see .env.example) if a machine cannot hold the defaults.
 transformers>=4.55,<5
 sentencepiece>=0.2
 torch>=2.2
