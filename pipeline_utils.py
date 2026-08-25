@@ -287,25 +287,46 @@ def setup_logging(name: str, log_file: str = "scraper.log") -> logging.Logger:
 
     A bare filename is placed inside ``LOG_DIR`` so every scraper's log lands
     in one directory without each scraper repeating the path.
+
+    The handlers go on the ROOT logger, not just the scraper's own, so that
+    warnings raised inside the shared modules reach the scraper's log file.
+    They previously did not: ``pipeline_utils`` logs to its own module logger,
+    which had no handler, so "sentiment model unavailable" -- the one message
+    that explains why a whole run came back with null sentiment -- never
+    appeared in the log at all. Chatty third-party loggers are pinned to
+    WARNING so this does not turn the file into a transformers/telethon dump.
     """
     logger = logging.getLogger(name)
-    if logger.handlers:  # avoid duplicate handlers if called twice
+    if logger.handlers or getattr(setup_logging, "_configured", False):
         return logger
 
-    logger.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-
-    console = logging.StreamHandler()
-    console.setFormatter(fmt)
-    logger.addHandler(console)
 
     if not os.path.dirname(log_file):
         log_file = os.path.join(LOG_DIR, log_file)
     os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
+
+    console = logging.StreamHandler()
+    console.setFormatter(fmt)
     file_handler = RotatingFileHandler(log_file, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
     file_handler.setFormatter(fmt)
-    logger.addHandler(file_handler)
 
+    root = logging.getLogger()
+    root.setLevel(logging.WARNING)      # gates library loggers, not this one
+    root.addHandler(console)
+    root.addHandler(file_handler)
+
+    # This scraper and the shared modules report at INFO; a record's level is
+    # checked against the logger it was emitted on, then handed to every
+    # ancestor handler, so these reach the handlers above while a library
+    # left at the root's WARNING does not.
+    logger.setLevel(logging.INFO)
+    for shared in ("pipeline_utils", "dedup_utils"):
+        logging.getLogger(shared).setLevel(logging.INFO)
+    for noisy in ("telethon", "transformers", "urllib3", "httpx", "asyncio", "filelock", "huggingface_hub"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    setup_logging._configured = True
     return logger
 
 
@@ -376,6 +397,12 @@ def is_english(text: str, min_confidence: float = 0.70) -> bool:
     return lang == "en" and prob >= min_confidence
 
 
+def _is_oom_error(exc) -> bool:
+    """Whether an exception is a GPU out-of-memory condition."""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return "outofmemory" in text or "out of memory" in text or "cuda error" in text
+
+
 def _load_sentiment_model(model_name: str):
     """Lazy-loads one sentiment pipeline by model name, cached per name.
 
@@ -394,7 +421,22 @@ def _load_sentiment_model(model_name: str):
             return None if cached is False else cached
         try:
             from transformers import pipeline
-            _SENTIMENT_BUNDLES[model_name] = pipeline("sentiment-analysis", model=model_name)
+            try:
+                _SENTIMENT_BUNDLES[model_name] = pipeline("sentiment-analysis", model=model_name)
+            except Exception as e:
+                # A GPU that is full (another scraper, another process, a
+                # smaller card) is a resource condition, not a missing model:
+                # retry pinned to CPU rather than nulling sentiment for the
+                # whole run. This mirrors _demote_nli_to_cpu on the NLI path,
+                # which already degrades this way instead of giving up.
+                if not _is_oom_error(e):
+                    raise
+                logging.getLogger(__name__).warning(
+                    "Sentiment model '%s' did not fit on the GPU (%s). Falling back to CPU.",
+                    model_name, str(e).splitlines()[0] if str(e) else type(e).__name__,
+                )
+                _SENTIMENT_BUNDLES[model_name] = pipeline(
+                    "sentiment-analysis", model=model_name, device=-1)
         except Exception as e:
             _SENTIMENT_BUNDLES[model_name] = False
             if model_name not in _SENTIMENT_WARNED:

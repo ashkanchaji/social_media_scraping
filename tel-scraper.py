@@ -383,6 +383,7 @@ async def scrape_channel(client, channel_username: str, lsh, hash_by_id, output_
     added_count = 0
     refreshed_count = 0
     skipped_non_english = 0
+    duplicates_kept = 0
     collected_at = datetime.datetime.now(datetime.timezone.utc).strftime(TIMESTAMP_FMT)
 
     for message in messages:
@@ -422,9 +423,16 @@ async def scrape_channel(client, channel_username: str, lsh, hash_by_id, output_
             skipped_non_english += 1
             continue
 
+        # Tagged, not dropped -- the same rule the other account-driven
+        # scrapers now follow. The channel is a trusted source and every
+        # message it posted inside the window belongs in the output; the flag
+        # stays on the record for a downstream stage to collapse repeats.
+        # Dropping here was also unrecoverable: registration happens before the
+        # file is written, so a run that died mid-write left the messages in
+        # the dedup index and invisible to every later run.
         duplication_info = dedup_utils.check_and_register(record_id, clean_text, lsh, hash_by_id)
         if duplication_info.get("is_duplicate"):
-            continue
+            duplicates_kept += 1
 
         record = _build_record(
             message, resolved_username, channel_title, clean_text,
@@ -439,8 +447,15 @@ async def scrape_channel(client, channel_username: str, lsh, hash_by_id, output_
 
     if skipped_non_english:
         logger.info(f"Filtered out {skipped_non_english} message(s) for '@{resolved_username}' in an unsupported language.")
+    if duplicates_kept:
+        logger.info(f"Kept {duplicates_kept} message(s) flagged as cross-source duplicates for '@{resolved_username}'.")
 
     if added_count or refreshed_count:
+        # Re-created here, not just at the top of the function: a channel scrape
+        # can run for tens of minutes, and losing the whole window's work to a
+        # missing directory at the final write is the worst possible moment to
+        # fail. RecordFile.save() guards its write the same way.
+        os.makedirs(os.path.dirname(master_file) or ".", exist_ok=True)
         with open(master_file, 'w', encoding='utf-8') as f:
             json.dump(existing_records, f, indent=4, ensure_ascii=False)
         logger.info(
