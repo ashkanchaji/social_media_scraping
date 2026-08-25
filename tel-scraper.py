@@ -33,6 +33,10 @@ import dedup_utils
 from pipeline_utils import (
     setup_logging,
     detect_language,
+    language_allowed,
+    KEYWORDS_DIR,
+    SOURCES_DIR,
+    SESSIONS_DIR,
     build_quality,
     analyze_text,
     env_int,
@@ -72,11 +76,11 @@ FLOOD_SLEEP_THRESHOLD = env_int("FLOOD_SLEEP_THRESHOLD", 60, prefix="TEL")
 FLOOD_WAIT_BUFFER = env_int("FLOOD_WAIT_BUFFER", 5, prefix="TEL")  # Extra seconds added to a server-dictated wait
 MAX_FLOOD_RETRIES = env_int("MAX_FLOOD_RETRIES", 3, prefix="TEL")
 
-TELEGRAM_SESSION_NAME = env_str("TELEGRAM_SESSION_NAME", "tel-scraper")
+TELEGRAM_SESSION_NAME = env_str("TELEGRAM_SESSION_NAME", os.path.join(SESSIONS_DIR, "tel-scraper"))
 TELEGRAM_API_ID = os.environ.get("TELEGRAM_API_ID")
 TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH")
 
-CHANNELS_FILE = "tel-channels.txt"
+CHANNELS_FILE = os.path.join(SOURCES_DIR, "tel-channels.txt")
 OUTPUT_DIR = "tel-transcripts/"
 TIMESTAMP_FMT = "%Y-%m-%d %H:%M:%S UTC"
 
@@ -256,7 +260,7 @@ def _build_record(message, channel_username: str, channel_title: str, clean_text
                   lang: str, duplication_info: dict, collected_at: str) -> dict:
     """Assembles one message into the shared cross-platform record schema."""
     post_url = f"https://t.me/{channel_username}/{message.id}"
-    translated_text, sentiment, asset_mention = analyze_text(clean_text, lang)
+    sentiment, asset_mention = analyze_text(clean_text, lang)
     record = {
         "record_id": f"Telegram_{channel_username}_{message.id}",
         "Source": {
@@ -273,8 +277,7 @@ def _build_record(message, channel_username: str, channel_title: str, clean_text
             "title": "N/A",
             "raw_text": clean_text,
             "Clean_text": "",
-            "language": lang,
-            "translated_text": translated_text
+            "language": lang
         },
         "time_stamps": {
             "published_at": _format_timestamp(message.date),
@@ -399,7 +402,7 @@ async def scrape_channel(client, channel_username: str, lsh, hash_by_id, output_
                 continue
 
             lang, confidence = detect_language(clean_text)
-            if lang not in ALLOWED_LANGUAGES or confidence < LANGUAGE_MIN_CONFIDENCE:
+            if not language_allowed(lang, confidence, ALLOWED_LANGUAGES, LANGUAGE_MIN_CONFIDENCE):
                 continue
 
             duplication_info = dedup_utils.check_and_register(record_id, clean_text, lsh, hash_by_id)
@@ -415,7 +418,7 @@ async def scrape_channel(client, channel_username: str, lsh, hash_by_id, output_
             continue
 
         lang, confidence = detect_language(clean_text)
-        if lang not in ALLOWED_LANGUAGES or confidence < LANGUAGE_MIN_CONFIDENCE:
+        if not language_allowed(lang, confidence, ALLOWED_LANGUAGES, LANGUAGE_MIN_CONFIDENCE):
             skipped_non_english += 1
             continue
 

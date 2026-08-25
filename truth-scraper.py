@@ -39,7 +39,11 @@ import dedup_utils
 from pipeline_utils import (
     setup_logging,
     RateLimiter,
+    with_retry,
     detect_language,
+    language_allowed,
+    KEYWORDS_DIR,
+    SOURCES_DIR,
     build_quality,
     analyze_text,
     get_scrape_mode,
@@ -50,6 +54,7 @@ from pipeline_utils import (
     env_set,
     env_range,
     env_str,
+    env_bool,
 )
 
 logger = setup_logging("truth-scraper", log_file="truth-scraper.log")
@@ -58,16 +63,25 @@ logger = setup_logging("truth-scraper", log_file="truth-scraper.log")
 # name applies to all scrapers, a "TS_"-prefixed name applies to this one only.
 MAX_POSTS_PER_ACCOUNT = env_int("MAX_POSTS_PER_ACCOUNT", 80, prefix="TS")
 MAX_PAST_MINUTES = env_int("MAX_PAST_MINUTES", 30 * 24 * 60, prefix="TS")  # default 30 days
-PAGE_SIZE = env_int("PAGE_SIZE", 40, prefix="TS")                          # Server-side maximum per statuses request
+PAGE_SIZE = env_int("PAGE_SIZE", 40, prefix="TS")                          # Requested per page; the server caps a page at 20
+API_TIMEOUT = env_int("API_TIMEOUT", 30, prefix="TS")                      # Seconds per API call
+# Wall-clock budget for paging ONE account. Cloudflare throttles deep paging by
+# trickling the response rather than refusing it, and a socket timeout never
+# fires on a connection that keeps delivering a few bytes. Without this ceiling
+# a single slow account can hang an unattended run indefinitely.
+ACCOUNT_TIME_BUDGET = env_int("ACCOUNT_TIME_BUDGET", 180, prefix="TS")      # Seconds
 
 FETCH_MIN_INTERVAL = env_float("FETCH_MIN_INTERVAL", 1.5, prefix="TS")            # Seconds between API calls, enforced globally
 ACCOUNT_DELAY_RANGE = env_range("ACCOUNT_DELAY_RANGE", (3.0, 6.0), prefix="TS")   # Jittered pause between accounts
 
 LANGUAGE_MIN_CONFIDENCE = env_float("LANGUAGE_MIN_CONFIDENCE", 0.70, prefix="TS")
 ALLOWED_LANGUAGES = env_set("ALLOWED_LANGUAGES", {"en", "fa"}, prefix="TS")
+# Replies are posts the account made too, so they are collected by default.
+# Set TS_EXCLUDE_REPLIES=true to go back to top-level posts only.
+EXCLUDE_REPLIES = env_bool("EXCLUDE_REPLIES", False, prefix="TS")
 
-KEYWORDS_FILE = "truth-keywords.txt"
-ACCOUNTS_FILE = "truth-accounts.txt"
+KEYWORDS_FILE = os.path.join(KEYWORDS_DIR, "truth-keywords.txt")
+ACCOUNTS_FILE = os.path.join(SOURCES_DIR, "truth-accounts.txt")
 OUTPUT_DIR = "truth-posts/"
 TIMESTAMP_FMT = "%Y-%m-%d %H:%M:%S UTC"
 
@@ -85,6 +99,31 @@ TRUTHSOCIAL_PASSWORD = env_str("TRUTHSOCIAL_PASSWORD") or None
 TRUTHSOCIAL_TOKEN = env_str("TRUTHSOCIAL_TOKEN") or None
 
 _fetch_rate_limiter = RateLimiter(FETCH_MIN_INTERVAL)
+
+def _read_bounded(response) -> bytes:
+    """Reads a response body under a wall-clock deadline.
+
+    ``urlopen(timeout=...)`` bounds each individual socket operation, not the
+    call as a whole. Cloudflare throttles a client it considers too eager by
+    TRICKLING the response instead of refusing it, and a body that delivers a
+    few bytes every couple of seconds never trips a per-read timeout -- the
+    call simply never returns, which hung unattended runs indefinitely. Reading
+    in chunks and checking the clock between them is what actually bounds it.
+    """
+    deadline = time.monotonic() + API_TIMEOUT
+    chunks = []
+    while True:
+        if time.monotonic() > deadline:
+            raise _RetryableApiError(f"response body still arriving after {API_TIMEOUT}s")
+        chunk = response.read(65536)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+class _RetryableApiError(Exception):
+    """A transient API failure worth retrying (timeout, connection reset, 429, 5xx)."""
+
 
 _BLOCK_TAG_RE = re.compile(r"</?(?:p|br|div|li)[^>]*>", re.IGNORECASE)
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -153,8 +192,16 @@ def _format_timestamp(value) -> str:
     return dt.strftime(TIMESTAMP_FMT) if dt else None
 
 
+@with_retry(max_attempts=3, base_delay=5.0, exceptions=(_RetryableApiError,))
 def _api_request(path: str, token: str = None, params: dict = None, payload: dict = None):
-    """Performs one authenticated call against the Mastodon-compatible API."""
+    """Performs one authenticated call against the Mastodon-compatible API.
+
+    Retried with backoff: Cloudflare fronts this API and answers a client it
+    considers too eager by stalling the connection rather than refusing it, so
+    a timeout here is usually transient. Combined with ACCOUNT_TIME_BUDGET in
+    fetch_statuses, a throttled account costs the run one bounded pause
+    instead of hanging it.
+    """
     url = API_BASE + path
     if params:
         url = f"{url}?{urllib.parse.urlencode(params)}"
@@ -167,8 +214,17 @@ def _api_request(path: str, token: str = None, params: dict = None, payload: dic
         headers["Authorization"] = f"Bearer {token}"
 
     request = urllib.request.Request(url, data=data, headers=headers)
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=API_TIMEOUT) as response:
+            return json.loads(_read_bounded(response).decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        # 429/5xx is "come back later" and worth a retry; 401/403/404 is a
+        # verdict about this request and retrying only wastes the budget.
+        if e.code == 429 or e.code >= 500:
+            raise _RetryableApiError(f"HTTP {e.code}") from e
+        raise
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+        raise _RetryableApiError(f"{type(e).__name__}: {e}") from e
 
 
 def login() -> str:
@@ -216,14 +272,34 @@ def fetch_statuses(account_id: str, token: str, cutoff) -> list:
     """
     statuses = []
     max_id = None
+    deadline = time.monotonic() + ACCOUNT_TIME_BUDGET
 
     while len(statuses) < MAX_POSTS_PER_ACCOUNT:
-        params = {"limit": min(PAGE_SIZE, MAX_POSTS_PER_ACCOUNT - len(statuses)), "exclude_replies": "true"}
+        if time.monotonic() > deadline:
+            logger.warning(
+                f"Time budget of {ACCOUNT_TIME_BUDGET}s reached after {len(statuses)} post(s); "
+                f"keeping them and moving on."
+            )
+            break
+        params = {"limit": min(PAGE_SIZE, MAX_POSTS_PER_ACCOUNT - len(statuses))}
+        if EXCLUDE_REPLIES:
+            params["exclude_replies"] = "true"
         if max_id:
             params["max_id"] = max_id
 
         _fetch_rate_limiter.wait()
-        page = _api_request(f"/api/v1/accounts/{account_id}/statuses", token=token, params=params)
+        try:
+            page = _api_request(f"/api/v1/accounts/{account_id}/statuses", token=token, params=params)
+        except Exception as e:
+            # Now that paging walks the whole window rather than stopping at
+            # the first short page, a single slow page is likely on a busy
+            # account. Keep what was already collected instead of losing the
+            # account for the run.
+            logger.warning(
+                f"Stopped paging after {len(statuses)} post(s): "
+                f"{type(e).__name__}: {str(e).splitlines()[0]}"
+            )
+            break
         if not isinstance(page, list) or not page:
             break
 
@@ -235,13 +311,30 @@ def fetch_statuses(account_id: str, token: str, cutoff) -> list:
                 break
             statuses.append(status)
 
-        if reached_cutoff or len(page) < params["limit"]:
+        # Deliberately NOT "len(page) < limit": Truth Social caps a page at 20
+        # statuses however many were asked for, so treating a short page as the
+        # end of the timeline stopped every account after its first page and
+        # capped a 30-day window at 20 posts. Only an EMPTY page, the time
+        # cutoff, or MAX_POSTS_PER_ACCOUNT ends the walk.
+        if reached_cutoff:
             break
         max_id = page[-1].get("id")
         if not max_id:
             break
 
     return statuses
+
+
+def _media_alt_text(status: dict) -> str:
+    """Best available text for a post whose body is empty.
+
+    A media-only post still carries a spoiler/CW line or per-attachment alt
+    text often enough to be worth keeping; that beats storing nothing.
+    """
+    parts = [str(status.get("spoiler_text") or "").strip()]
+    for attachment in (status.get("media_attachments") or []):
+        parts.append(str(attachment.get("description") or "").strip())
+    return " ".join(p for p in parts if p).strip()
 
 
 def _extract_media_info(status: dict) -> dict:
@@ -273,10 +366,18 @@ def _build_engagement(status: dict) -> dict:
 
 def _build_record(status: dict, username: str, display_name: str, raw_text: str,
                   lang: str, duplication_info: dict, collected_at: str,
-                  context_terms=None) -> dict:
-    """Assembles one status into the shared cross-platform record schema."""
+                  context_terms=None, media_status: dict = None,
+                  text_is_complete: bool = True) -> dict:
+    """Assembles one status into the shared cross-platform record schema.
+
+    ``media_status`` is the status the CONTENT came from -- the reblogged post
+    for a repost, otherwise the status itself. Identity, id, URL and timestamps
+    always come from ``status``, so a repost stays addressable at this
+    account's own permalink.
+    """
+    media_status = media_status or status
     status_id = str(status.get("id"))
-    translated_text, sentiment, asset_mention = analyze_text(
+    sentiment, asset_mention = analyze_text(
         raw_text, lang, context_terms=context_terms or [])
     record = {
         "record_id": f"TruthSocial_{username}_{status_id}",
@@ -294,8 +395,7 @@ def _build_record(status: dict, username: str, display_name: str, raw_text: str,
             "title": "N/A",
             "raw_text": raw_text,
             "Clean_text": "",
-            "language": lang,
-            "translated_text": translated_text
+            "language": lang
         },
         "time_stamps": {
             "published_at": _format_timestamp(status.get("created_at")),
@@ -307,10 +407,14 @@ def _build_record(status: dict, username: str, display_name: str, raw_text: str,
         "asset_mention": asset_mention,
         "sentiment": sentiment,
         "Engagement": _build_engagement(status),
-        "media": _extract_media_info(status),
+        "media": _extract_media_info(media_status),
         "deduplication": duplication_info
     }
-    record["quality"] = build_quality(record, complete_raw_text=True, extraction_errors=[])
+    record["quality"] = build_quality(
+        record,
+        complete_raw_text=text_is_complete,
+        extraction_errors=[] if text_is_complete else ["media-only post: no text body on the status"],
+    )
     return record
 
 
@@ -372,14 +476,12 @@ def scrape_account(username: str, token: str, lsh, hash_by_id, keywords=None, ou
 
     skipped_unsupported_lang = 0
     skipped_no_keyword = 0
+    reblogged = 0
+    media_only = 0
+    duplicates_kept = 0
     collected_at = datetime.datetime.now(datetime.timezone.utc).strftime(TIMESTAMP_FMT)
 
     for status in statuses:
-        # A reblog carries someone else's content under this account; the
-        # original is the record worth storing, so it is skipped here.
-        if status.get("reblog"):
-            continue
-
         status_id = str(status.get("id") or "")
         if not status_id:
             continue
@@ -388,9 +490,29 @@ def scrape_account(username: str, token: str, lsh, hash_by_id, keywords=None, ou
         if any(bucket.has(record_id) for bucket in buckets.values()):
             continue
 
-        raw_text = _html_to_text(status.get("content"))
+        # A reblog is a post this trusted account chose to amplify, so it is
+        # collected like any other. Its text and media come from the reblogged
+        # status, while the identity/URL stay this account's -- the record is
+        # "@account reposted this", which is exactly what happened.
+        reblog = status.get("reblog") if isinstance(status.get("reblog"), dict) else None
+        if reblog:
+            reblogged += 1
+        content_status = reblog or status
+
+        raw_text = _html_to_text(content_status.get("content"))
         if not raw_text:
-            continue
+            # A media-only post (image/video, no caption) is still a post from
+            # a trusted account inside the window. It is stored with the media
+            # description as text where one exists, and flagged as an
+            # incomplete extraction so the quality score reflects reality --
+            # dropping it silently lost roughly half of some accounts' output.
+            raw_text = _media_alt_text(content_status)
+            text_is_complete = bool(raw_text)
+            if not raw_text:
+                raw_text = "[media-only post with no text]"
+            media_only += 1
+        else:
+            text_is_complete = True
 
         matched_keyword = None
         if keywords:
@@ -400,17 +522,21 @@ def scrape_account(username: str, token: str, lsh, hash_by_id, keywords=None, ou
                 continue
 
         lang, confidence = detect_language(raw_text)
-        if lang not in ALLOWED_LANGUAGES or confidence < LANGUAGE_MIN_CONFIDENCE:
+        if not language_allowed(lang, confidence, ALLOWED_LANGUAGES, LANGUAGE_MIN_CONFIDENCE):
             skipped_unsupported_lang += 1
             continue
 
+        # Tagged, not dropped: the account is a trusted source and every post
+        # it made inside the window belongs in the output. The flag stays on
+        # the record for a downstream stage to collapse repeats.
         duplication_info = dedup_utils.check_and_register(record_id, raw_text, lsh, hash_by_id)
         if duplication_info.get("is_duplicate"):
-            continue
+            duplicates_kept += 1
 
         record = _build_record(status, resolved_username, display_name, raw_text,
                                lang, duplication_info, collected_at,
-                               context_terms=[matched_keyword] if matched_keyword else [])
+                               context_terms=[matched_keyword] if matched_keyword else [],
+                               media_status=content_status, text_is_complete=text_is_complete)
 
         buckets[matched_keyword].add(record, _parse_api_timestamp(status.get("created_at")))
 
@@ -418,6 +544,12 @@ def scrape_account(username: str, token: str, lsh, hash_by_id, keywords=None, ou
         logger.info(f"Filtered out {skipped_unsupported_lang} unsupported-language post(s) for '@{resolved_username}'.")
     if skipped_no_keyword:
         logger.info(f"Filtered out {skipped_no_keyword} post(s) matching no keyword for '@{resolved_username}'.")
+    if reblogged:
+        logger.info(f"Collected {reblogged} repost(s) for '@{resolved_username}'.")
+    if media_only:
+        logger.info(f"Collected {media_only} media-only post(s) for '@{resolved_username}'.")
+    if duplicates_kept:
+        logger.info(f"Kept {duplicates_kept} post(s) flagged as cross-source duplicates for '@{resolved_username}'.")
 
     written = [bucket.path for bucket in buckets.values() if bucket.save()]
     if not written:

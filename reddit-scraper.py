@@ -39,6 +39,9 @@ from pipeline_utils import (
     setup_logging,
     with_retry,
     detect_language,
+    language_allowed,
+    KEYWORDS_DIR,
+    SOURCES_DIR,
     build_quality,
     analyze_text,
     get_scrape_mode,
@@ -65,8 +68,8 @@ SEARCH_DELAY_RANGE = env_range("SEARCH_DELAY_RANGE", (3.0, 6.0), prefix="RD")  #
 LANGUAGE_MIN_CONFIDENCE = env_float("LANGUAGE_MIN_CONFIDENCE", 0.70, prefix="RD")
 ALLOWED_LANGUAGES = env_set("ALLOWED_LANGUAGES", {"en", "fa"}, prefix="RD")
 
-KEYWORDS_FILE = "reddit-keywords.txt"
-SUBREDDITS_FILE = "reddit-subreddits.txt"
+KEYWORDS_FILE = os.path.join(KEYWORDS_DIR, "reddit-keywords.txt")
+SUBREDDITS_FILE = os.path.join(SOURCES_DIR, "reddit-subreddits.txt")
 OUTPUT_DIR = "reddit-posts/"
 TIMESTAMP_FMT = "%Y-%m-%d %H:%M:%S UTC"
 
@@ -207,7 +210,7 @@ def _build_record(submission, subreddit_name: str, raw_text: str, lang: str,
     """Assembles one submission into the shared cross-platform record schema."""
     permalink = f"https://www.reddit.com{getattr(submission, 'permalink', '')}"
     edited = getattr(submission, "edited", False)
-    translated_text, sentiment, asset_mention = analyze_text(
+    sentiment, asset_mention = analyze_text(
         raw_text,
         lang,
         asset_text=(str(getattr(submission, "title", "") or "") + "\n" + raw_text).strip(),
@@ -229,8 +232,7 @@ def _build_record(submission, subreddit_name: str, raw_text: str, lang: str,
             "title": getattr(submission, "title", "N/A") or "N/A",
             "raw_text": raw_text,
             "Clean_text": "",
-            "language": lang,
-            "translated_text": translated_text
+            "language": lang
         },
         "time_stamps": {
             "published_at": _format_timestamp(getattr(submission, "created_utc", None)),
@@ -305,7 +307,7 @@ def _merge_submissions(submissions, master_file: str, keyword, lsh, hash_by_id, 
             continue
 
         lang, confidence = detect_language(raw_text)
-        if lang not in ALLOWED_LANGUAGES or confidence < LANGUAGE_MIN_CONFIDENCE:
+        if not language_allowed(lang, confidence, ALLOWED_LANGUAGES, LANGUAGE_MIN_CONFIDENCE):
             skipped_unsupported_lang += 1
             continue
 

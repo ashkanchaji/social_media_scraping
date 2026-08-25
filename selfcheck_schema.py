@@ -75,7 +75,6 @@ def make_record(platform, author_id, source_id, url, content_type, media):
             "raw_text": "Oil prices moved on the latest supply report.",
             "Clean_text": "",
             "language": "en",
-            "translated_text": None,
         },
         "time_stamps": {
             "published_at": PUBLISHED,
@@ -157,52 +156,74 @@ def check_record_file():
 
 
 def check_fa_analysis_routing():
-    """A Persian record must be scored and asset-matched on its translation.
+    """A non-English record is analysed in its OWN language -- never translated.
 
-    The registry aliases and both models are English-only, so routing the raw
-    Persian text into them would silently produce no assets and no sentiment.
-    The models themselves are stubbed here: this checks the routing, which is
-    the part that breaks silently.
+    Nothing in the pipeline translates any more, so this checks that a Persian
+    record is scored by the multilingual sentiment model on its original text,
+    that an English one still goes to FinBERT, and that a Persian record's
+    asset mentions actually come back. The last part is the bug this replaced:
+    the English-only NLI model used to contradict real mentions in Persian
+    text and delete them.
     """
-    original = pipeline_utils.translate_fa_to_en
     original_sentiment = pipeline_utils.analyze_sentiment
     original_assets = pipeline_utils.extract_asset_mentions
     seen = {}
     try:
-        def fake_sentiment(text):
+        def fake_sentiment(text, lang="en"):
             seen["sentiment_input"] = text
+            seen["sentiment_lang"] = lang
             return {"label": "positive", "confidence": 0.9}
 
-        def fake_assets(text, context_terms=None):
+        def fake_assets(text, context_terms=None, lang="en", **kwargs):
             seen["asset_input"] = text
+            seen["asset_lang"] = lang
             return []
 
-        pipeline_utils.translate_fa_to_en = lambda text: "oil prices rose"
         pipeline_utils.analyze_sentiment = fake_sentiment
         pipeline_utils.extract_asset_mentions = fake_assets
 
-        translated, sentiment, _ = pipeline_utils.analyze_text("قیمت نفت بالا رفت", "fa")
-        assert translated == "oil prices rose", translated
-        assert seen["sentiment_input"] == "oil prices rose", seen
-        assert seen["asset_input"] == "oil prices rose", seen
+        sentiment, _ = pipeline_utils.analyze_text("قیمت نفت بالا رفت", "fa")
+        assert seen["sentiment_input"] == "قیمت نفت بالا رفت", seen
+        assert seen["asset_input"] == "قیمت نفت بالا رفت", seen
+        assert seen["sentiment_lang"] == "fa" and seen["asset_lang"] == "fa", seen
         assert sentiment["label"] == "positive"
 
         seen.clear()
-        translated, _, _ = pipeline_utils.analyze_text("Oil prices rose", "en")
-        assert translated is None, "an English record must not carry a translation"
+        pipeline_utils.analyze_text("Oil prices rose", "en")
         assert seen["asset_input"] == "Oil prices rose", seen
-
-        # With the translation model unavailable the original text is still
-        # analysed, so cashtags and Latin symbols stay matchable.
-        seen.clear()
-        pipeline_utils.translate_fa_to_en = lambda text: None
-        translated, sentiment, _ = pipeline_utils.analyze_text("$BTC بالا رفت", "fa")
-        assert translated is None and sentiment["label"] is None, sentiment
-        assert seen["asset_input"] == "$BTC بالا رفت", seen
+        assert seen["sentiment_lang"] == "en", seen
     finally:
-        pipeline_utils.translate_fa_to_en = original
         pipeline_utils.analyze_sentiment = original_sentiment
         pipeline_utils.extract_asset_mentions = original_assets
+
+    # Model routing: English -> FinBERT, anything else -> the multilingual model.
+    assert pipeline_utils._sentiment_model_for("en") == pipeline_utils._SENTIMENT_MODEL_NAME
+    assert pipeline_utils._sentiment_model_for("fa") == pipeline_utils._MULTILINGUAL_SENTIMENT_MODEL_NAME
+
+    # The reported bug: a Persian post naming USDT must come back WITH assets.
+    # No model is stubbed here -- the NLI model is skipped for non-Latin text,
+    # so this runs on alias matching alone and needs no download.
+    fa_assets = pipeline_utils.extract_asset_mentions(
+        "قیمت تتر امروز بالا رفت و USDT گران شد. طلا هم رشد کرد.", lang="fa")
+    symbols = {a["Symbol"] for a in fa_assets}
+    assert "USDT" in symbols, fa_assets
+    assert "XAU" in symbols, fa_assets
+    # Unicode word boundaries: "طلایی" (golden, the colour) is not "طلا" (gold).
+    assert not any(a["Symbol"] == "XAU" for a in
+                   pipeline_utils.extract_asset_mentions("رنگ طلایی زیباست", lang="fa"))
+
+    # A non-Latin record must not normalize to an empty dedup key -- that made
+    # every Persian post an exact duplicate of every other one.
+    import dedup_utils
+    assert dedup_utils._normalize_text("قیمت نفت بالا رفت").strip(), "Persian text normalized away"
+    assert (dedup_utils._normalize_text("قیمت نفت") != dedup_utils._normalize_text("قیمت طلا"))
+
+    # The language gate drops a post only when the detector is CONFIDENT it is
+    # some other language; an unsure verdict on a short post is kept.
+    assert pipeline_utils.language_allowed("en", 0.99, {"en", "fa"}, 0.70)
+    assert pipeline_utils.language_allowed("de", 0.40, {"en", "fa"}, 0.70), "unsure verdict must be kept"
+    assert not pipeline_utils.language_allowed("de", 0.95, {"en", "fa"}, 0.70)
+
     print("fa/en analysis routing: ok")
 
 

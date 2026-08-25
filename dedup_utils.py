@@ -18,6 +18,7 @@ yt-scraper.py at the same time, or a future 24/7 daemon.
 Install: pip install datasketch numpy --break-system-packages
 """
 
+import os
 import re
 import json
 import hashlib
@@ -25,7 +26,7 @@ import sqlite3
 import numpy as np
 from datasketch import MinHash, MinHashLSH
 
-DB_PATH = "dedup-index.db"
+DB_PATH = os.path.join("dedup", "dedup-index.db")
 NUM_PERM = 128
 # Jaccard similarity threshold for "near-duplicate". Lower = catches more
 # loosely related coverage; higher = only near-identical phrasing. 0.5-0.6
@@ -38,7 +39,10 @@ SHINGLE_SIZE = 4  # words per shingle
 def _normalize_text(text: str) -> str:
     text = text.lower()
     text = re.sub(r"http\S+", "", text)       # strip URLs (differ even for identical stories)
-    text = re.sub(r"[^a-z0-9\s]", " ", text)   # strip punctuation/emoji
+    # Unicode-aware: an ASCII-only class would erase Persian/Arabic text
+    # entirely, normalizing every non-Latin record to the same empty string
+    # and making all of them exact duplicates of each other.
+    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)   # strip punctuation/emoji
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -58,6 +62,7 @@ def _make_minhash(text: str) -> MinHash:
 
 
 def _get_conn() -> sqlite3.Connection:
+    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL;")  # lets multiple processes read while one writes
     conn.execute("""

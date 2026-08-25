@@ -160,37 +160,45 @@ def get_scrape_mode(logger=None, prefix: str = "") -> str:
 
 
 # Built-in starter registry. Projects can extend/override this without code
-# changes by placing an ``asset-registry.json`` file beside the scraper.
+# changes by placing an ``assets-registry/asset-registry.json`` file in the repo.
 # Besides aliases, entries may include ``topics`` and ``description``; those
 # fields are used by the NLI relevance model for context-only inference.
 _DEFAULT_ASSET_REGISTRY = [
-    {"canonical_name": "Bitcoin", "Symbol": "BTC", "asset_class": "cryptocurrency", "asset_id": "crypto:BTC", "aliases": ["bitcoin", "btc", "xbt"], "topics": ["crypto", "cryptocurrency", "digital assets"], "description": "the Bitcoin cryptocurrency"},
-    {"canonical_name": "Ethereum", "Symbol": "ETH", "asset_class": "cryptocurrency", "asset_id": "crypto:ETH", "aliases": ["ethereum", "ether", "eth"], "topics": ["crypto", "smart contracts", "digital assets"], "description": "the Ethereum cryptocurrency and smart-contract network"},
-    {"canonical_name": "Solana", "Symbol": "SOL", "asset_class": "cryptocurrency", "asset_id": "crypto:SOL", "aliases": ["solana", "sol"], "topics": ["crypto", "blockchain", "digital assets"], "description": "the Solana cryptocurrency and blockchain"},
-    {"canonical_name": "XRP", "Symbol": "XRP", "asset_class": "cryptocurrency", "asset_id": "crypto:XRP", "aliases": ["xrp", "ripple"], "topics": ["crypto", "payments", "digital assets"], "description": "the XRP cryptocurrency associated with Ripple payments"},
-    {"canonical_name": "Gold", "Symbol": "XAU", "asset_class": "commodity", "asset_id": "commodity:XAU", "aliases": ["gold", "xau", "xauusd"], "topics": ["precious metals", "safe haven", "bullion"], "description": "the gold precious-metal commodity"},
-    {"canonical_name": "Silver", "Symbol": "XAG", "asset_class": "commodity", "asset_id": "commodity:XAG", "aliases": ["silver", "xag", "xagusd"], "topics": ["precious metals", "bullion"], "description": "the silver precious-metal commodity"},
+    {"canonical_name": "Bitcoin", "Symbol": "BTC", "asset_class": "cryptocurrency", "asset_id": "crypto:BTC", "aliases": ["bitcoin", "btc", "xbt", "بیت کوین", "بیتکوین", "بیت‌کوین"], "topics": ["crypto", "cryptocurrency", "digital assets"], "description": "the Bitcoin cryptocurrency"},
+    {"canonical_name": "Ethereum", "Symbol": "ETH", "asset_class": "cryptocurrency", "asset_id": "crypto:ETH", "aliases": ["ethereum", "ether", "eth", "اتریوم", "اتر"], "topics": ["crypto", "smart contracts", "digital assets"], "description": "the Ethereum cryptocurrency and smart-contract network"},
+    {"canonical_name": "Solana", "Symbol": "SOL", "asset_class": "cryptocurrency", "asset_id": "crypto:SOL", "aliases": ["solana", "sol", "سولانا"], "topics": ["crypto", "blockchain", "digital assets"], "description": "the Solana cryptocurrency and blockchain"},
+    {"canonical_name": "XRP", "Symbol": "XRP", "asset_class": "cryptocurrency", "asset_id": "crypto:XRP", "aliases": ["xrp", "ripple", "ریپل"], "topics": ["crypto", "payments", "digital assets"], "description": "the XRP cryptocurrency associated with Ripple payments"},
+    {"canonical_name": "Gold", "Symbol": "XAU", "asset_class": "commodity", "asset_id": "commodity:XAU", "aliases": ["gold", "xau", "xauusd", "طلا", "انس طلا", "طلای جهانی"], "topics": ["precious metals", "safe haven", "bullion"], "description": "the gold precious-metal commodity"},
+    {"canonical_name": "Silver", "Symbol": "XAG", "asset_class": "commodity", "asset_id": "commodity:XAG", "aliases": ["silver", "xag", "xagusd", "نقره"], "topics": ["precious metals", "bullion"], "description": "the silver precious-metal commodity"},
     {"canonical_name": "WTI Crude Oil", "Symbol": "WTI", "asset_class": "commodity", "asset_id": "commodity:WTI", "aliases": ["wti", "wti crude", "west texas intermediate"], "topics": ["oil", "crude", "petroleum", "energy markets", "oil prices", "OPEC"], "description": "West Texas Intermediate crude oil benchmark"},
-    {"canonical_name": "Brent Crude Oil", "Symbol": "BRENT", "asset_class": "commodity", "asset_id": "commodity:BRENT", "aliases": ["brent", "brent crude", "brent oil"], "topics": ["oil", "crude", "petroleum", "energy markets", "oil prices", "OPEC"], "description": "Brent crude oil benchmark"},
-    {"canonical_name": "Crude Oil", "Symbol": "OIL", "asset_class": "commodity", "asset_id": "commodity:OIL", "aliases": ["crude oil", "oil prices", "oil price"], "topics": ["oil", "petroleum", "energy markets", "refining", "OPEC", "oil supply", "oil demand"], "description": "global crude-oil prices and petroleum markets"},
+    {"canonical_name": "Brent Crude Oil", "Symbol": "BRENT", "asset_class": "commodity", "asset_id": "commodity:BRENT", "aliases": ["brent", "brent crude", "brent oil", "برنت", "نفت برنت"], "topics": ["oil", "crude", "petroleum", "energy markets", "oil prices", "OPEC"], "description": "Brent crude oil benchmark"},
+    {"canonical_name": "Crude Oil", "Symbol": "OIL", "asset_class": "commodity", "asset_id": "commodity:OIL", "aliases": ["crude oil", "oil prices", "oil price", "نفت", "نفت خام", "قیمت نفت"], "topics": ["oil", "petroleum", "energy markets", "refining", "OPEC", "oil supply", "oil demand"], "description": "global crude-oil prices and petroleum markets"},
     {"canonical_name": "Energy Select Sector SPDR Fund", "Symbol": "XLE", "asset_class": "ETF", "asset_id": "etf:XLE", "aliases": ["xle", "energy select sector spdr"], "topics": ["energy stocks", "oil stocks", "oil companies", "oil and gas companies", "energy companies", "integrated oil companies"], "description": "a US exchange-traded fund tracking large energy, oil and gas companies"},
     {"canonical_name": "Exxon Mobil", "Symbol": "XOM", "asset_class": "equity", "asset_id": "equity:XOM", "aliases": ["exxon", "exxon mobil", "xom"], "topics": ["oil company", "energy company", "integrated oil and gas"], "description": "Exxon Mobil, an integrated oil and gas company"},
     {"canonical_name": "Chevron", "Symbol": "CVX", "asset_class": "equity", "asset_id": "equity:CVX", "aliases": ["chevron", "cvx"], "topics": ["oil company", "energy company", "integrated oil and gas"], "description": "Chevron, an integrated oil and gas company"},
     {"canonical_name": "Shell", "Symbol": "SHEL", "asset_class": "equity", "asset_id": "equity:SHEL", "aliases": ["shell plc", "shell", "shel"], "topics": ["oil company", "energy company", "integrated oil and gas", "LNG"], "description": "Shell plc, an integrated oil, gas and LNG company"},
     {"canonical_name": "BP", "Symbol": "BP", "asset_class": "equity", "asset_id": "equity:BP", "aliases": ["bp plc", "bp"], "topics": ["oil company", "energy company", "integrated oil and gas"], "description": "BP plc, an integrated oil and gas company"},
-    {"canonical_name": "S&P 500", "Symbol": "SPX", "asset_class": "index", "asset_id": "index:SPX", "aliases": ["s&p 500", "s&p500", "sp500", "spx"], "topics": ["US stocks", "large cap stocks", "US equity market"], "description": "the S&P 500 US large-cap equity index"},
-    {"canonical_name": "Nasdaq Composite", "Symbol": "IXIC", "asset_class": "index", "asset_id": "index:IXIC", "aliases": ["nasdaq composite", "nasdaq", "ixic"], "topics": ["technology stocks", "US stocks", "growth stocks"], "description": "the Nasdaq Composite equity index"},
-    {"canonical_name": "Dow Jones Industrial Average", "Symbol": "DJI", "asset_class": "index", "asset_id": "index:DJI", "aliases": ["dow jones", "dow", "djia", "dji"], "topics": ["US stocks", "blue chip stocks"], "description": "the Dow Jones Industrial Average US equity index"},
-    {"canonical_name": "US Dollar", "Symbol": "USD", "asset_class": "currency", "asset_id": "fx:USD", "aliases": ["us dollar", "u.s. dollar", "usd", "dollar index", "dxy"], "topics": ["foreign exchange", "FX", "dollar", "Federal Reserve"], "description": "the United States dollar currency"},
-    {"canonical_name": "Euro", "Symbol": "EUR", "asset_class": "currency", "asset_id": "fx:EUR", "aliases": ["euro", "eur"], "topics": ["foreign exchange", "FX", "ECB", "eurozone"], "description": "the euro currency"},
-    {"canonical_name": "British Pound", "Symbol": "GBP", "asset_class": "currency", "asset_id": "fx:GBP", "aliases": ["british pound", "pound sterling", "sterling", "gbp"], "topics": ["foreign exchange", "FX", "Bank of England", "UK currency"], "description": "the British pound sterling currency"},
-    {"canonical_name": "Japanese Yen", "Symbol": "JPY", "asset_class": "currency", "asset_id": "fx:JPY", "aliases": ["japanese yen", "yen", "jpy"], "topics": ["foreign exchange", "FX", "Bank of Japan", "Japan currency"], "description": "the Japanese yen currency"},
-    {"canonical_name": "Apple", "Symbol": "AAPL", "asset_class": "equity", "asset_id": "equity:AAPL", "aliases": ["apple inc", "apple", "aapl"], "topics": ["iPhone", "consumer technology", "big tech"], "description": "Apple Inc. common stock"},
+    {"canonical_name": "S&P 500", "Symbol": "SPX", "asset_class": "index", "asset_id": "index:SPX", "aliases": ["s&p 500", "s&p500", "sp500", "spx", "اس اند پی"], "topics": ["US stocks", "large cap stocks", "US equity market"], "description": "the S&P 500 US large-cap equity index"},
+    {"canonical_name": "Nasdaq Composite", "Symbol": "IXIC", "asset_class": "index", "asset_id": "index:IXIC", "aliases": ["nasdaq composite", "nasdaq", "ixic", "نزدک", "نزدَک"], "topics": ["technology stocks", "US stocks", "growth stocks"], "description": "the Nasdaq Composite equity index"},
+    {"canonical_name": "Dow Jones Industrial Average", "Symbol": "DJI", "asset_class": "index", "asset_id": "index:DJI", "aliases": ["dow jones", "dow", "djia", "dji", "داوجونز", "داو جونز"], "topics": ["US stocks", "blue chip stocks"], "description": "the Dow Jones Industrial Average US equity index"},
+    {"canonical_name": "US Dollar", "Symbol": "USD", "asset_class": "currency", "asset_id": "fx:USD", "aliases": ["us dollar", "u.s. dollar", "usd", "dollar index", "dxy", "دلار", "شاخص دلار"], "topics": ["foreign exchange", "FX", "dollar", "Federal Reserve"], "description": "the United States dollar currency"},
+    {"canonical_name": "Euro", "Symbol": "EUR", "asset_class": "currency", "asset_id": "fx:EUR", "aliases": ["euro", "eur", "یورو"], "topics": ["foreign exchange", "FX", "ECB", "eurozone"], "description": "the euro currency"},
+    {"canonical_name": "British Pound", "Symbol": "GBP", "asset_class": "currency", "asset_id": "fx:GBP", "aliases": ["british pound", "pound sterling", "sterling", "gbp", "پوند"], "topics": ["foreign exchange", "FX", "Bank of England", "UK currency"], "description": "the British pound sterling currency"},
+    {"canonical_name": "Japanese Yen", "Symbol": "JPY", "asset_class": "currency", "asset_id": "fx:JPY", "aliases": ["japanese yen", "yen", "jpy", "ین"], "topics": ["foreign exchange", "FX", "Bank of Japan", "Japan currency"], "description": "the Japanese yen currency"},
+    {"canonical_name": "Apple", "Symbol": "AAPL", "asset_class": "equity", "asset_id": "equity:AAPL", "aliases": ["apple inc", "apple", "aapl", "اپل"], "topics": ["iPhone", "consumer technology", "big tech"], "description": "Apple Inc. common stock"},
     {"canonical_name": "Microsoft", "Symbol": "MSFT", "asset_class": "equity", "asset_id": "equity:MSFT", "aliases": ["microsoft", "msft"], "topics": ["software", "cloud computing", "Azure", "big tech"], "description": "Microsoft Corporation common stock"},
-    {"canonical_name": "NVIDIA", "Symbol": "NVDA", "asset_class": "equity", "asset_id": "equity:NVDA", "aliases": ["nvidia", "nvda"], "topics": ["AI chips", "GPUs", "semiconductors", "artificial intelligence"], "description": "NVIDIA Corporation common stock"},
-    {"canonical_name": "Tesla", "Symbol": "TSLA", "asset_class": "equity", "asset_id": "equity:TSLA", "aliases": ["tesla", "tsla"], "topics": ["electric vehicles", "EVs", "automotive"], "description": "Tesla Inc. common stock"},
+    {"canonical_name": "NVIDIA", "Symbol": "NVDA", "asset_class": "equity", "asset_id": "equity:NVDA", "aliases": ["nvidia", "nvda", "انویدیا"], "topics": ["AI chips", "GPUs", "semiconductors", "artificial intelligence"], "description": "NVIDIA Corporation common stock"},
+    {"canonical_name": "Tesla", "Symbol": "TSLA", "asset_class": "equity", "asset_id": "equity:TSLA", "aliases": ["tesla", "tsla", "تسلا"], "topics": ["electric vehicles", "EVs", "automotive"], "description": "Tesla Inc. common stock"},
     {"canonical_name": "Amazon", "Symbol": "AMZN", "asset_class": "equity", "asset_id": "equity:AMZN", "aliases": ["amazon", "amzn"], "topics": ["ecommerce", "AWS", "cloud computing", "big tech"], "description": "Amazon.com Inc. common stock"},
     {"canonical_name": "Meta Platforms", "Symbol": "META", "asset_class": "equity", "asset_id": "equity:META", "aliases": ["meta platforms", "meta", "facebook", "meta stock"], "topics": ["social media", "digital advertising", "big tech"], "description": "Meta Platforms Inc. common stock"},
+    {"canonical_name": "Tether", "Symbol": "USDT", "asset_class": "cryptocurrency", "asset_id": "crypto:USDT", "aliases": ["tether", "usdt", "تتر"], "topics": ["crypto", "stablecoin", "digital assets", "dollar peg"], "description": "the Tether (USDT) dollar-pegged stablecoin"},
+    {"canonical_name": "USD Coin", "Symbol": "USDC", "asset_class": "cryptocurrency", "asset_id": "crypto:USDC", "aliases": ["usd coin", "usdc"], "topics": ["crypto", "stablecoin", "digital assets", "dollar peg"], "description": "the USD Coin (USDC) dollar-pegged stablecoin"},
+    {"canonical_name": "BNB", "Symbol": "BNB", "asset_class": "cryptocurrency", "asset_id": "crypto:BNB", "aliases": ["bnb", "binance coin", "بی ان بی"], "topics": ["crypto", "exchange token", "digital assets"], "description": "the BNB cryptocurrency of the BNB Chain"},
+    {"canonical_name": "Cardano", "Symbol": "ADA", "asset_class": "cryptocurrency", "asset_id": "crypto:ADA", "aliases": ["cardano", "ada", "کاردانو"], "topics": ["crypto", "blockchain", "digital assets"], "description": "the Cardano cryptocurrency"},
+    {"canonical_name": "Dogecoin", "Symbol": "DOGE", "asset_class": "cryptocurrency", "asset_id": "crypto:DOGE", "aliases": ["dogecoin", "doge", "دوج کوین", "دوج"], "topics": ["crypto", "meme coin", "digital assets"], "description": "the Dogecoin cryptocurrency"},
+    {"canonical_name": "Toncoin", "Symbol": "TON", "asset_class": "cryptocurrency", "asset_id": "crypto:TON", "aliases": ["toncoin", "ton coin", "تون کوین"], "topics": ["crypto", "Telegram", "digital assets"], "description": "the Toncoin cryptocurrency of The Open Network"},
+    {"canonical_name": "Natural Gas", "Symbol": "NG", "asset_class": "commodity", "asset_id": "commodity:NG", "aliases": ["natural gas", "henry hub", "lng", "گاز طبیعی", "گاز"], "topics": ["gas", "energy markets", "LNG", "energy prices"], "description": "natural gas and LNG markets"},
+    {"canonical_name": "Iranian Rial", "Symbol": "IRR", "asset_class": "currency", "asset_id": "fx:IRR", "aliases": ["iranian rial", "irr", "toman", "ریال", "تومان"], "topics": ["foreign exchange", "FX", "Iran currency", "Iran economy"], "description": "the Iranian rial/toman currency"},
 ]
 
 # Content_type each platform emits. A platform missing from this map fails the
@@ -236,21 +244,39 @@ _ASSET_CONTEXT_CACHE = {}
 _ASSET_CONTEXT_CACHE_LOCK = threading.Lock()
 _ASSET_MODEL_WARNING_EMITTED = False
 
-# FinBERT sentiment, and Persian->English translation so non-English records
-# still carry an English field for downstream NLP that expects one.
+# Sentiment is scored in the record's OWN language -- nothing is translated
+# anywhere in this pipeline, and records carry no translated_text field.
+# FinBERT is English-only and finance-tuned, so it stays the English scorer;
+# any other language routes to a multilingual model instead, because feeding
+# FinBERT Persian would tokenize to mostly [UNK] and fabricate a label out of
+# noise. Set MULTILINGUAL_SENTIMENT_MODEL="none" to score only English and
+# leave every other language's sentiment null.
 _SENTIMENT_MODEL_NAME = env_str("SENTIMENT_MODEL", "ProsusAI/finbert")
-_SENTIMENT_BUNDLE = None
+_MULTILINGUAL_SENTIMENT_MODEL_NAME = env_str(
+    "MULTILINGUAL_SENTIMENT_MODEL", "cardiffnlp/twitter-xlm-roberta-base-sentiment")
+# Two independently-loaded pipelines keyed by model name, so a run that sees
+# both English and Persian records pays for each model exactly once.
+_SENTIMENT_BUNDLES = {}
 _SENTIMENT_LOCK = threading.Lock()
-_SENTIMENT_WARNING_EMITTED = False
+_SENTIMENT_WARNED = set()
+# cardiffnlp ships LABEL_0/1/2 rather than words; map both spellings.
+_SENTIMENT_LABEL_MAP = {
+    "label_0": "negative", "label_1": "neutral", "label_2": "positive",
+    "negative": "negative", "neutral": "neutral", "positive": "positive",
+    "neg": "negative", "neu": "neutral", "pos": "positive",
+}
 
-# Helsinki-NLP retired the standalone "opus-mt-fa-en" repo; Persian now lives
-# in this multi-target Iranian-languages model, which requires a sentence
-# initial ">>eng<<" target-language token (added in translate_fa_to_en below).
-_TRANSLATION_MODEL_NAME = env_str("FA_EN_TRANSLATION_MODEL", "Helsinki-NLP/opus-mt-tc-bible-big-ira-deu_eng_fra_por_spa")
-_TRANSLATION_TARGET_TOKEN = ">>eng<< "
-_TRANSLATION_BUNDLE = None
-_TRANSLATION_LOCK = threading.Lock()
-_TRANSLATION_WARNING_EMITTED = False
+
+# Repo layout: the scrapers keep only code in the repo root, and every kind of
+# run artifact/input lives in its own directory. Scrapers reference these
+# constants rather than bare filenames so a move is a one-line change here.
+LOG_DIR = "logs"
+KEYWORDS_DIR = "keywords"
+SOURCES_DIR = "sources"
+ASSETS_REGISTRY_DIR = "assets-registry"
+DEDUP_DIR = "dedup"
+SESSIONS_DIR = "sessions"
+ASSET_REGISTRY_PATH = os.path.join(ASSETS_REGISTRY_DIR, "asset-registry.json")
 
 
 def setup_logging(name: str, log_file: str = "scraper.log") -> logging.Logger:
@@ -258,6 +284,9 @@ def setup_logging(name: str, log_file: str = "scraper.log") -> logging.Logger:
     Console + rotating file logging. Replaces bare print() calls so a
     long-running/24-7 process has a persistent, size-capped log to check,
     not just whatever scrolled past in a terminal.
+
+    A bare filename is placed inside ``LOG_DIR`` so every scraper's log lands
+    in one directory without each scraper repeating the path.
     """
     logger = logging.getLogger(name)
     if logger.handlers:  # avoid duplicate handlers if called twice
@@ -270,6 +299,9 @@ def setup_logging(name: str, log_file: str = "scraper.log") -> logging.Logger:
     console.setFormatter(fmt)
     logger.addHandler(console)
 
+    if not os.path.dirname(log_file):
+        log_file = os.path.join(LOG_DIR, log_file)
+    os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
     file_handler = RotatingFileHandler(log_file, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
     file_handler.setFormatter(fmt)
     logger.addHandler(file_handler)
@@ -344,51 +376,65 @@ def is_english(text: str, min_confidence: float = 0.70) -> bool:
     return lang == "en" and prob >= min_confidence
 
 
-def _load_sentiment_model():
-    """Lazy-loads the FinBERT sentiment pipeline. Returns None if unavailable
-    (missing transformers/torch or a model-download failure) -- callers then
-    store a null sentiment rather than fabricating one."""
-    global _SENTIMENT_BUNDLE, _SENTIMENT_WARNING_EMITTED
-    if _SENTIMENT_BUNDLE is False:
+def _load_sentiment_model(model_name: str):
+    """Lazy-loads one sentiment pipeline by model name, cached per name.
+
+    Returns None if unavailable (missing transformers/torch, a download
+    failure, or the model explicitly disabled with "none") -- callers then
+    store a null sentiment rather than fabricating one.
+    """
+    if not model_name or model_name.strip().lower() in {"", "none", "off", "disabled"}:
         return None
-    if _SENTIMENT_BUNDLE is not None:
-        return _SENTIMENT_BUNDLE
+    cached = _SENTIMENT_BUNDLES.get(model_name)
+    if cached is not None:
+        return None if cached is False else cached
     with _SENTIMENT_LOCK:
-        if _SENTIMENT_BUNDLE is not None:
-            return None if _SENTIMENT_BUNDLE is False else _SENTIMENT_BUNDLE
+        cached = _SENTIMENT_BUNDLES.get(model_name)
+        if cached is not None:
+            return None if cached is False else cached
         try:
             from transformers import pipeline
-            _SENTIMENT_BUNDLE = pipeline("sentiment-analysis", model=_SENTIMENT_MODEL_NAME)
+            _SENTIMENT_BUNDLES[model_name] = pipeline("sentiment-analysis", model=model_name)
         except Exception as e:
-            _SENTIMENT_BUNDLE = False
-            if not _SENTIMENT_WARNING_EMITTED:
+            _SENTIMENT_BUNDLES[model_name] = False
+            if model_name not in _SENTIMENT_WARNED:
                 logging.getLogger(__name__).warning(
-                    "Sentiment model unavailable (%s). sentiment.label/confidence will be null.",
-                    str(e).splitlines()[0] if str(e) else type(e).__name__,
+                    "Sentiment model '%s' unavailable (%s). sentiment.label/confidence will be null.",
+                    model_name, str(e).splitlines()[0] if str(e) else type(e).__name__,
                 )
-                _SENTIMENT_WARNING_EMITTED = True
+                _SENTIMENT_WARNED.add(model_name)
             return None
-    return _SENTIMENT_BUNDLE
+    return _SENTIMENT_BUNDLES[model_name]
 
 
-def analyze_sentiment(text: str) -> dict:
-    """Runs FinBERT sentiment on ``text`` (expected to already be English --
-    callers should pass the translated_text for Persian records).
+def _sentiment_model_for(lang: str) -> str:
+    """FinBERT for English, the multilingual model for anything else.
+
+    Nothing is translated any more, so a Persian record is scored as Persian.
+    FinBERT would tokenize it to mostly [UNK] and return a label built out of
+    noise, which is worse than a null.
+    """
+    return _SENTIMENT_MODEL_NAME if (lang or "en") == "en" else _MULTILINGUAL_SENTIMENT_MODEL_NAME
+
+
+def analyze_sentiment(text: str, lang: str = "en") -> dict:
+    """Scores ``text`` in its own language -- English through FinBERT, any
+    other language through the multilingual model.
 
     Returns {"label": "positive"|"neutral"|"negative", "confidence": 0-1} or
-    {"label": None, "confidence": None} for empty input or when the model is
-    unavailable.
+    {"label": None, "confidence": None} for empty input or when the model for
+    that language is unavailable.
     """
     text = (text or "").strip()
     if not text:
         return {"label": None, "confidence": None}
-    model = _load_sentiment_model()
+    model = _load_sentiment_model(_sentiment_model_for(lang))
     if not model:
         return {"label": None, "confidence": None}
-    # FinBERT's input window is 512 tokens, so scoring a long transcript in one
-    # call silently judges the whole video by its opening ~380 words. Chunking
-    # and averaging the per-label probabilities keeps every part of the text in
-    # the verdict; a short post is a single chunk and behaves exactly as before.
+    # These models have a 512-token input window, so scoring a long transcript
+    # in one call silently judges the whole video by its opening ~380 words.
+    # Chunking and averaging the per-label probabilities keeps every part of
+    # the text in the verdict; a short post is a single chunk.
     chunks = _split_nli_premise(text, max_chars=1200, max_chunks=12)
     if not chunks:
         return {"label": None, "confidence": None}
@@ -397,7 +443,11 @@ def analyze_sentiment(text: str) -> dict:
         totals = {}
         for scores in outputs:
             for entry in scores:
-                label = str(entry["label"]).lower()
+                # cardiffnlp emits LABEL_0/1/2, FinBERT emits words; both are
+                # mapped onto the schema's three labels.
+                label = _SENTIMENT_LABEL_MAP.get(str(entry["label"]).lower())
+                if label is None:
+                    continue
                 totals[label] = totals.get(label, 0.0) + float(entry["score"])
         if not totals:
             return {"label": None, "confidence": None}
@@ -410,89 +460,39 @@ def analyze_sentiment(text: str) -> dict:
         return {"label": None, "confidence": None}
 
 
-def _load_translation_model():
-    """Lazy-loads the fa->en translation pipeline. Returns None if unavailable."""
-    global _TRANSLATION_BUNDLE, _TRANSLATION_WARNING_EMITTED
-    if _TRANSLATION_BUNDLE is False:
-        return None
-    if _TRANSLATION_BUNDLE is not None:
-        return _TRANSLATION_BUNDLE
-    with _TRANSLATION_LOCK:
-        if _TRANSLATION_BUNDLE is not None:
-            return None if _TRANSLATION_BUNDLE is False else _TRANSLATION_BUNDLE
-        try:
-            from transformers import pipeline
-            _TRANSLATION_BUNDLE = pipeline("translation", model=_TRANSLATION_MODEL_NAME)
-        except Exception as e:
-            _TRANSLATION_BUNDLE = False
-            if not _TRANSLATION_WARNING_EMITTED:
-                logging.getLogger(__name__).warning(
-                    "Translation model unavailable (%s). Persian records will be stored without translated_text.",
-                    str(e).splitlines()[0] if str(e) else type(e).__name__,
-                )
-                _TRANSLATION_WARNING_EMITTED = True
-            return None
-    return _TRANSLATION_BUNDLE
-
-
-def translate_fa_to_en(text: str) -> str:
-    """Translates Persian text to English, chunked for long transcripts.
-
-    Returns None for empty input or when the model is unavailable -- never
-    a partial/garbled translation.
-    """
-    text = (text or "").strip()
-    if not text:
-        return None
-    model = _load_translation_model()
-    if not model:
-        return None
-    chunks = _split_nli_premise(text, max_chars=1000, max_chunks=20)
-    if not chunks:
-        return None
-    try:
-        pieces = [
-            model(_TRANSLATION_TARGET_TOKEN + chunk, truncation=True)[0]["translation_text"]
-            for chunk in chunks
-        ]
-        translated = " ".join(p.strip() for p in pieces if p and p.strip()).strip()
-        return translated or None
-    except Exception as e:
-        logging.getLogger(__name__).warning(
-            "Translation failed: %s", str(e).splitlines()[0] if str(e) else type(e).__name__
-        )
-        return None
-
-
 def analyze_text(text: str, lang: str, asset_text: str = None, context_terms=None) -> tuple:
-    """Returns (translated_text, sentiment_dict, asset_mention_list) for one record.
+    """Returns (sentiment_dict, asset_mention_list) for one record.
 
-    Shared by every scraper so the fa/en handling is identical everywhere:
-
-    * English record -- sentiment and asset extraction run on the text
-      directly and ``translated_text`` stays None.
-    * Persian record -- the text is translated once, then BOTH FinBERT and the
-      asset stage read the translation. FinBERT is English-only, and the asset
-      registry's aliases and the NLI relevance model are English too, so a
-      Persian record scored on its original text would report no assets no
-      matter what it was about. If the translation model is unavailable the
-      original text is still passed through, which keeps cashtags and Latin
-      symbols matchable.
+    The single entry point every scraper uses for text analysis, so the
+    per-language handling is identical everywhere. Nothing is translated: the
+    record's own text is scored in its own language (FinBERT for English, the
+    multilingual model otherwise) and asset extraction reads the same original
+    text, matching both Latin aliases/cashtags and the registry's non-Latin
+    aliases against it.
 
     ``asset_text`` lets a scraper widen the asset input beyond the record's
     raw_text (Reddit adds the title, TikTok the video description); it defaults
     to ``text``.
     """
     asset_text = text if asset_text is None else asset_text
-    if lang != "fa":
-        return None, analyze_sentiment(text), extract_asset_mentions(asset_text, context_terms=context_terms)
+    return (
+        analyze_sentiment(text, lang),
+        extract_asset_mentions(asset_text, context_terms=context_terms, lang=lang),
+    )
 
-    translated = translate_fa_to_en(text)
-    sentiment = analyze_sentiment(translated) if translated else {"label": None, "confidence": None}
-    asset_source = translated if asset_text == text else translate_fa_to_en(asset_text)
-    assets = extract_asset_mentions(asset_source or asset_text, context_terms=context_terms)
-    return translated, sentiment, assets
 
+def language_allowed(lang: str, confidence: float, allowed, min_confidence: float) -> bool:
+    """Whether a record's detected language clears the collection filter.
+
+    A post is dropped only when the detector is CONFIDENT it is a language
+    outside ``allowed``. A low-confidence verdict is the detector saying it
+    does not know -- which is the normal outcome for a three-word post, a
+    headline, or a caption full of hashtags -- and dropping those threw away
+    real posts from the trusted accounts the run is supposed to collect.
+    """
+    if lang in allowed:
+        return True
+    return confidence < min_confidence
 
 
 TIMESTAMP_FMT = "%Y-%m-%d %H:%M:%S UTC"
@@ -630,7 +630,7 @@ def _normalized_asset_entry(entry: dict) -> dict:
     }
 
 
-def load_asset_registry(filepath: str = "asset-registry.json") -> list:
+def load_asset_registry(filepath: str = ASSET_REGISTRY_PATH) -> list:
     """Load the built-in registry plus optional project-specific definitions.
 
     Custom entries can add aliases, topics and a natural-language description.
@@ -668,10 +668,34 @@ def load_asset_registry(filepath: str = "asset-registry.json") -> list:
 
 
 def _find_alias(text: str, alias: str):
+    r"""Finds ``alias`` in ``text`` on word boundaries, in any script.
+
+    The boundary class is \w (Unicode-aware), not [A-Za-z0-9_]: with the ASCII
+    class a Persian alias like "طلا" matched inside "طلایی", because the
+    following Persian letter is not an ASCII word character and therefore
+    counted as a boundary.
+    """
     if not text or not alias:
         return None
-    pattern = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(alias) + r"(?![A-Za-z0-9_])", re.IGNORECASE)
+    pattern = re.compile(r"(?<!\w)" + re.escape(alias) + r"(?!\w)", re.IGNORECASE | re.UNICODE)
     return pattern.search(text)
+
+
+_LATIN_RE = re.compile(r"[A-Za-z]")
+
+
+def _is_latin_text(text: str, min_ratio: float = 0.5) -> bool:
+    """Whether ``text`` is mostly Latin script.
+
+    The NLI relevance model is English-only. Fed a Persian premise it does not
+    return "unsure" -- it returns a confident verdict on tokens it never saw,
+    which used to CONTRADICT perfectly real mentions and delete them. So the
+    model is consulted only for text it can actually read.
+    """
+    letters = [c for c in (text or "") if c.isalpha()]
+    if not letters:
+        return False
+    return sum(1 for c in letters if _LATIN_RE.match(c)) / len(letters) >= min_ratio
 
 
 def _asset_hypothesis(entry: dict) -> str:
@@ -890,7 +914,8 @@ def _context_candidates(context_terms, registry: list) -> list:
     return result
 
 
-def extract_asset_mentions(text: str, context_terms=None, registry_path: str = "asset-registry.json") -> list:
+def extract_asset_mentions(text: str, context_terms=None, lang: str = "en",
+                           registry_path: str = ASSET_REGISTRY_PATH) -> list:
     """Extract direct and contextual financial-asset relevance.
 
     Confidence is produced by a Natural Language Inference model, not by
@@ -909,6 +934,12 @@ def extract_asset_mentions(text: str, context_terms=None, registry_path: str = "
         context_terms = [context_terms]
 
     registry = load_asset_registry(registry_path)
+    # The NLI relevance model reads English only. For a non-Latin record it is
+    # skipped entirely: direct alias/cashtag matches are facts that stand on
+    # their own and are emitted with a null confidence, rather than being
+    # filtered by a model that cannot read the premise. This is what made a
+    # Persian post saying "USDT" come back with no asset_mention at all.
+    model_readable = _is_latin_text(text) and (lang or "en") not in {"fa", "ar", "ru", "zh", "ja", "ko", "he"}
     symbol_map = {e.get("Symbol", "").upper(): e for e in registry if e.get("Symbol")}
     direct = {}
     unknown = {}
@@ -938,14 +969,14 @@ def extract_asset_mentions(text: str, context_terms=None, registry_path: str = "
         if best:
             direct[entry.get("asset_id") or entry.get("Symbol") or entry.get("canonical_name")] = (entry, best)
 
-    context = _context_candidates(context_terms, registry)
+    context = _context_candidates(context_terms, registry) if model_readable else []
     candidate_map = {key: pair for key, pair in direct.items()}
     for entry, query_score in context:
         key = entry.get("asset_id") or entry.get("Symbol") or entry.get("canonical_name")
         candidate_map.setdefault(key, (entry, None))
 
     entries = [pair[0] for pair in candidate_map.values()]
-    text_scores = _nli_asset_scores(text, entries)
+    text_scores = _nli_asset_scores(text, entries) if model_readable else {}
     query_score_by_key = {
         entry.get("asset_id") or entry.get("Symbol") or entry.get("canonical_name"): score
         for entry, score in context
@@ -1397,16 +1428,8 @@ def build_quality(
     ]
     if platform in _TITLED_PLATFORMS:
         content_checks.append(("valid_title", bool(str(content.get("title") or "").strip()) and content.get("title") != "N/A"))
-    # translated_text is required only for Persian records; for everything
-    # else it must stay None (same null-means-not-applicable rule as
-    # time_stamps.updated_at). A Persian record with translated_text=None is
-    # still valid -- the translation model may simply be unavailable in this
-    # environment, which is not this record's defect.
-    translated_text = content.get("translated_text")
-    if content.get("language") == "fa":
-        content_checks.append(("valid_translation", translated_text is None or (isinstance(translated_text, str) and bool(translated_text.strip()))))
-    else:
-        content_checks.append(("valid_translation", translated_text is None))
+    # No translated_text check: the pipeline does not translate, so a record
+    # carries only its original text in its own language.
 
     timestamp_checks = [
         ("valid_published_at", published is not None),
@@ -1481,6 +1504,17 @@ def build_quality(
 # properly, matching the quality of YouTube's own auto-translate captions.
 # "small" is a reasonable speed/quality balance for an RTX 3070; bump to
 # "medium" if translation quality on non-English sources still looks weak.
+# Whisper's task for the audio fallback: "translate" emits an English
+# transcript of non-English speech, "transcribe" keeps the spoken language.
+# This is the ONE remaining place a non-English source can become English, and
+# it is deliberate: for a video with no captions the transcript IS the record's
+# only text, so there is no original being replaced. Set WHISPER_TASK=transcribe
+# to keep spoken Persian as Persian -- sentiment then routes to the
+# multilingual model like any other non-English record.
+WHISPER_TASK = env_str("WHISPER_TASK", "translate").strip().lower()
+if WHISPER_TASK not in {"translate", "transcribe"}:
+    WHISPER_TASK = "translate"
+
 WHISPER_MODEL_SIZE = env_str("WHISPER_MODEL_SIZE", "small")
 
 _whisper_model = None
@@ -1620,7 +1654,7 @@ def transcribe_audio(media_url: str, media_id: str, duration: int = 0,
             # verbatim in whatever language is detected. Combined with a
             # multilingual model (not "*.en"), this is what actually handles
             # non-English source audio correctly.
-            segments, info = model.transcribe(audio_file, beam_size=2, task="translate")
+            segments, info = model.transcribe(audio_file, beam_size=2, task=WHISPER_TASK)
             transcript_text = " ".join([seg.text.strip() for seg in segments])
             elapsed = time.time() - start_t
             log.info(

@@ -10,7 +10,6 @@ __pycache__/
 
 # Project Specifics (Data & Databases)
 reports/
-sentiments/
 yt-transcripts/
 twtr-tweets/
 tel-transcripts/
@@ -18,39 +17,31 @@ reddit-posts/
 tiktok-videos/
 truth-posts/
 x-tweet-fetcher/
-cache/
-social_scrapers_documentation_company_style_fa.pdf
 
 # Security & Credentials
 .env
 
-twtr-keywords.txt
-twtr-accounts.txt
-twtr-scraper.log
-yt-keywords.txt
-yt-channels.txt
-yt-scraper.log
-tel-channels.txt
-tel-scraper.log
-reddit-keywords.txt
-reddit-subreddits.txt
-reddit-scraper.log
-tiktok-accounts.txt
-tiktok-keywords.txt
-tiktok-scraper.log
-truth-accounts.txt
-truth-keywords.txt
-truth-scraper.log
+# Monitored keywords and source lists reveal what is being watched.
+keywords/
+sources/
+
+# Scraper logs (one directory, rotated 5MB x 3 per scraper).
+logs/
 
 # Telethon login sessions are live account credentials.
 *.session
 *.session-journal
+sessions/
 
-dedup-index.db
+# Regenerable run artifacts.
+dedup/
+
+# The live registry is local config; the committed template is the example.
+assets-registry/asset-registry.json
 
 test.py
 
 # Runner artifacts (scheduled runs)
 .run-scrapers.lock
-run-scrapers.log
+logs/run-scrapers.log
 .env.bak.*

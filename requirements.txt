@@ -9,12 +9,14 @@ nvidia-cublas-cu12==12.9.2.10
 nvidia-cudnn-cu12==9.24.0.43
 
 # --- twtr-scraper.py ---
+# Account mode reads X's public syndication timeline over stdlib urllib;
+# ddgs is keyword-mode discovery and xtf is the per-tweet fetch + the
+# account-mode fallback when syndication is unavailable.
 ddgs
 x-tweet-fetcher
 
 # --- tel-scraper.py ---
 telethon>=1.36,<2
-sacremoses
 
 # --- reddit-scraper.py ---
 praw>=7.7,<8
@@ -32,17 +34,20 @@ datasketch
 # --- pipeline_utils.py ---
 py3langid
 python-dotenv
-# --- semantic asset relevance, FinBERT sentiment, and fa->en translation
-# (shared by every scraper) ---
+# --- semantic asset relevance and sentiment (shared by every scraper) ---
+# Nothing is translated anywhere in this pipeline; every record is analysed
+# in its own language, so there is no translation model here any more.
 # ASSET_NLI_MODEL (MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli
 # by default, and it must stay a three-class NLI model) derives asset
-# relevance confidence from entailment probabilities;
-# SENTIMENT_MODEL (ProsusAI/finbert) scores positive/neutral/negative
-# sentiment; and FA_EN_TRANSLATION_MODEL (an opus-mt Iranian-languages model)
-# translates Persian records to English. All three are transformers models,
-# downloaded on first use and cached by huggingface_hub -- no extra packages
-# beyond what's already here. Every model name is overridable from .env
-# (see .env.example) if a machine cannot hold the defaults.
+# relevance confidence from entailment probabilities -- it is English-only and
+# is skipped entirely for non-Latin text.
+# SENTIMENT_MODEL (ProsusAI/finbert) scores English records, and
+# MULTILINGUAL_SENTIMENT_MODEL (cardiffnlp/twitter-xlm-roberta-base-sentiment)
+# scores every other language, Persian included.
+# All are transformers models, downloaded on first use and cached by
+# huggingface_hub -- no extra packages beyond what's already here. Every model
+# name is overridable from .env (see .env.example) if a machine cannot hold
+# the defaults.
 transformers>=4.55,<5
 sentencepiece>=0.2
 torch>=2.2

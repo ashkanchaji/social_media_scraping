@@ -15,6 +15,9 @@ from pipeline_utils import (
     with_retry,
     RateLimiter,
     detect_language,
+    language_allowed,
+    KEYWORDS_DIR,
+    SOURCES_DIR,
     build_quality,
     get_whisper_model,
     transcribe_audio,
@@ -60,7 +63,7 @@ ALLOWED_LANGUAGES = env_set("ALLOWED_LANGUAGES", {"en", "fa"}, prefix="YT")
 
 _fetch_rate_limiter = RateLimiter(FETCH_MIN_INTERVAL)
 
-def load_trusted_channels(filepath: str = "yt-channels.txt") -> list:
+def load_trusted_channels(filepath: str = os.path.join(SOURCES_DIR, "yt-channels.txt")) -> list:
     default_channels = ["Reuters", "Bloomberg", "CNBC", "BBC", "CNN", "Al Jazeera"]
     if not os.path.exists(filepath):
         logger.warning(f"'{filepath}' not found. Creating default file.")
@@ -371,7 +374,7 @@ def _fetch_and_write_videos(candidate_ids: list, master_file: str, context_terms
             continue
 
         lang, confidence = detect_language(clean_text)
-        if lang not in ALLOWED_LANGUAGES or confidence < LANGUAGE_MIN_CONFIDENCE:
+        if not language_allowed(lang, confidence, ALLOWED_LANGUAGES, LANGUAGE_MIN_CONFIDENCE):
             skipped_unsupported_lang += 1
             continue
 
@@ -389,7 +392,7 @@ def _fetch_and_write_videos(candidate_ids: list, master_file: str, context_terms
         collected_at = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
 
         asset_evidence_text = (str(meta.get("title") or "") + "\n" + clean_text).strip()
-        translated_text, sentiment, asset_mention = analyze_text(
+        sentiment, asset_mention = analyze_text(
             clean_text, lang, asset_text=asset_evidence_text, context_terms=context_terms)
 
         record = {
@@ -408,8 +411,7 @@ def _fetch_and_write_videos(candidate_ids: list, master_file: str, context_terms
                 "title": meta.get("title", "N/A"),
                 "raw_text": clean_text,
                 "Clean_text": "",
-                "language": lang,
-                "translated_text": translated_text
+                "language": lang
             },
             "time_stamps": {
                 "published_at": meta.get("upload_datetime", "N/A"),
@@ -491,7 +493,7 @@ def scrape_channel_videos(channel_name: str, lsh, hash_by_id, output_dir: str = 
 
 
 def main():
-    channels_file = "yt-channels.txt"
+    channels_file = os.path.join(SOURCES_DIR, "yt-channels.txt")
     trusted_channels = load_trusted_channels(channels_file)
     logger.info(f"Loaded {len(trusted_channels)} trusted channels from {channels_file}.")
 
@@ -514,7 +516,7 @@ def main():
         logger.info("Scraping for all trusted channels is done.")
         return
 
-    keyword_file = "yt-keywords.txt"
+    keyword_file = os.path.join(KEYWORDS_DIR, "yt-keywords.txt")
     if not os.path.exists(keyword_file):
         logger.error(f"File '{keyword_file}' not found.")
         return

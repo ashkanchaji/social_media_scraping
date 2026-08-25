@@ -32,6 +32,9 @@ from pipeline_utils import (
     with_retry,
     RateLimiter,
     detect_language,
+    language_allowed,
+    KEYWORDS_DIR,
+    SOURCES_DIR,
     build_quality,
     get_whisper_model,
     transcribe_audio,
@@ -63,8 +66,8 @@ ACCOUNT_DELAY_RANGE = env_range("ACCOUNT_DELAY_RANGE", (5.0, 10.0), prefix="TT")
 LANGUAGE_MIN_CONFIDENCE = env_float("LANGUAGE_MIN_CONFIDENCE", 0.70, prefix="TT")
 ALLOWED_LANGUAGES = env_set("ALLOWED_LANGUAGES", {"en", "fa"}, prefix="TT")
 
-KEYWORDS_FILE = "tiktok-keywords.txt"
-ACCOUNTS_FILE = "tiktok-accounts.txt"
+KEYWORDS_FILE = os.path.join(KEYWORDS_DIR, "tiktok-keywords.txt")
+ACCOUNTS_FILE = os.path.join(SOURCES_DIR, "tiktok-accounts.txt")
 OUTPUT_DIR = "tiktok-videos/"
 TIMESTAMP_FMT = "%Y-%m-%d %H:%M:%S UTC"
 
@@ -253,7 +256,7 @@ def _build_record(info: dict, username: str, video_id: str, video_url: str, raw_
                   context_terms=None) -> dict:
     """Assembles one video into the shared cross-platform record schema."""
     display_name = (info.get('uploader') or info.get('channel') or username).strip()
-    translated_text, sentiment, asset_mention = analyze_text(
+    sentiment, asset_mention = analyze_text(
         raw_text,
         lang,
         asset_text=((info.get('description') or '') + "\n" + raw_text).strip(),
@@ -275,8 +278,7 @@ def _build_record(info: dict, username: str, video_id: str, video_url: str, raw_
             "title": "N/A",
             "raw_text": raw_text,
             "Clean_text": "",
-            "language": lang,
-            "translated_text": translated_text
+            "language": lang
         },
         "time_stamps": {
             "published_at": _format_timestamp(info.get('timestamp')),
@@ -341,6 +343,9 @@ def scrape_account(username: str, lsh, hash_by_id, keywords=None, output_dir: st
 
     skipped_unsupported_lang = 0
     skipped_no_keyword = 0
+    skipped_out_of_window = 0
+    skipped_no_text = 0
+    duplicates_kept = 0
     collected_at = datetime.datetime.now(datetime.timezone.utc).strftime(TIMESTAMP_FMT)
 
     for video_id in new_video_ids:
@@ -357,17 +362,18 @@ def scrape_account(username: str, lsh, hash_by_id, keywords=None, output_dir: st
         timestamp = info.get('timestamp')
         if timestamp:
             published_dt = datetime.datetime.fromtimestamp(float(timestamp), datetime.timezone.utc)
-            # The listing is newest-first, so the first video past the window
-            # means every remaining one is older too.
+            # NOT a break: an account's pinned videos are listed first and can
+            # be years old, so the first out-of-window video is no proof the
+            # rest are older. Breaking here ended the whole account after one
+            # old pin and was why a 30-video listing produced a single record.
             if published_dt < cutoff:
-                break
+                skipped_out_of_window += 1
+                continue
 
         text, complete_raw_text, extraction_errors = extract_video_text(video_url, info, caption_text)
-        if not text:
-            continue
-
-        raw_text = text.replace("\n", " ").strip()
+        raw_text = (text or "").replace("\n", " ").strip()
         if not raw_text:
+            skipped_no_text += 1
             continue
 
         matched_keyword = None
@@ -379,14 +385,18 @@ def scrape_account(username: str, lsh, hash_by_id, keywords=None, output_dir: st
                 continue
 
         lang, confidence = detect_language(raw_text)
-        if lang not in ALLOWED_LANGUAGES or confidence < LANGUAGE_MIN_CONFIDENCE:
+        if not language_allowed(lang, confidence, ALLOWED_LANGUAGES, LANGUAGE_MIN_CONFIDENCE):
             skipped_unsupported_lang += 1
             continue
 
         record_id = f"TikTok_{username}_{video_id}"
+        # A duplicate is TAGGED, not dropped: the account is a trusted source
+        # and the run is meant to collect everything it posted in the window.
+        # deduplication.is_duplicate stays on the record so a downstream stage
+        # can still collapse cross-platform repeats of the same story.
         duplication_info = dedup_utils.check_and_register(record_id, raw_text, lsh, hash_by_id)
         if duplication_info.get("is_duplicate"):
-            continue
+            duplicates_kept += 1
 
         record = _build_record(info, username, video_id, video_url, raw_text, lang,
                                duplication_info, collected_at, complete_raw_text, extraction_errors,
@@ -398,6 +408,12 @@ def scrape_account(username: str, lsh, hash_by_id, keywords=None, output_dir: st
         logger.info(f"Filtered out {skipped_unsupported_lang} unsupported-language video(s) for '@{username}'.")
     if skipped_no_keyword:
         logger.info(f"Filtered out {skipped_no_keyword} video(s) matching no keyword for '@{username}'.")
+    if skipped_out_of_window:
+        logger.info(f"Skipped {skipped_out_of_window} video(s) older than {MAX_PAST_MINUTES} minute(s) for '@{username}'.")
+    if skipped_no_text:
+        logger.info(f"Skipped {skipped_no_text} video(s) with no caption, transcript or description for '@{username}'.")
+    if duplicates_kept:
+        logger.info(f"Kept {duplicates_kept} video(s) flagged as cross-source duplicates for '@{username}'.")
 
     written = [bucket.path for bucket in buckets.values() if bucket.save()]
     if not written:

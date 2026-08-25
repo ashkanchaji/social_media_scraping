@@ -2,7 +2,7 @@
 # One pass over every platform scraper, non-interactive.
 #
 # Schedule it every 10 minutes with cron (crontab -e):
-#   */10 * * * * /home/achaji2563/Desktop/Codes/Social\ Media\ Scraping/run-scrapers.sh >> /home/achaji2563/Desktop/Codes/Social\ Media\ Scraping/run-scrapers.log 2>&1
+#   */10 * * * * /home/achaji2563/Desktop/Codes/Social\ Media\ Scraping/run-scrapers.sh >> /home/achaji2563/Desktop/Codes/Social\ Media\ Scraping/logs/run-scrapers.log 2>&1
 #
 # All configuration (discovery mode, time window, credentials) comes from .env,
 # which pipeline_utils loads on import. Keep MAX_PAST_MINUTES larger than the

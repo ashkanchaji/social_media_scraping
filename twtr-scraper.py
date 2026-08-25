@@ -7,6 +7,9 @@ import random
 import json
 import bisect
 import datetime
+import urllib.error
+import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from ddgs import DDGS
 from ddgs.exceptions import RatelimitException, TimeoutException
@@ -17,6 +20,9 @@ from pipeline_utils import (
     with_retry,
     RateLimiter,
     detect_language,
+    language_allowed,
+    KEYWORDS_DIR,
+    SOURCES_DIR,
     build_quality,
     analyze_text,
     get_scrape_mode,
@@ -46,6 +52,20 @@ FETCH_MAX_WORKERS = env_int("FETCH_MAX_WORKERS", 10, prefix="X")            # co
 FETCH_MIN_INTERVAL = env_float("FETCH_MIN_INTERVAL", 0.5, prefix="X")      # seconds between fetch calls, enforced globally across all workers
 DDGS_DELAY_RANGE = env_range("DDGS_DELAY_RANGE", (12.0, 18.0), prefix="X")  # Pacing delay between keyword searches
 DDGS_MAX_RETRIES = env_int("DDGS_MAX_RETRIES", 3, prefix="X")              # Number of retry attempts on rate limit/timeout
+# Pacing for the syndication timeline in account mode. It is unauthenticated
+# and answers a burst with HTTP 429, so a 125-account list needs a real pause
+# between accounts -- without one the run degrades to the low-yield DDG
+# fallback for most of the list.
+ACCOUNT_DELAY_RANGE = env_range("ACCOUNT_DELAY_RANGE", (3.0, 6.0), prefix="X")
+
+# Keyword mode used to hard-drop every DuckDuckGo hit whose author was not in
+# twtr-accounts.txt, which threw away ~90% of each search. The trusted list now
+# PRIORITISES rather than filters: a trusted author is always kept, and an
+# untrusted one is kept when the account/post clears any one of these
+# credibility bars. Set all three to 0 to keep every author.
+UNTRUSTED_MIN_FOLLOWERS = env_int("UNTRUSTED_MIN_FOLLOWERS", 20_000, prefix="X")
+UNTRUSTED_MIN_LIKES = env_int("UNTRUSTED_MIN_LIKES", 1_000, prefix="X")
+UNTRUSTED_MIN_VIEWS = env_int("UNTRUSTED_MIN_VIEWS", 10_000, prefix="X")
 
 LANGUAGE_MIN_CONFIDENCE = env_float("LANGUAGE_MIN_CONFIDENCE", 0.70, prefix="X")
 ALLOWED_LANGUAGES = env_set("ALLOWED_LANGUAGES", {"en", "fa"}, prefix="X")
@@ -74,10 +94,35 @@ def _quiet_xtf():
         yield
 
 TWEET_URL_RE = re.compile(r"https?://(?:www\.)?(?:x|twitter)\.com/([A-Za-z0-9_]+)/status/(\d+)")
+
+# X's public syndication endpoint -- the same JSON that powers embedded-timeline
+# widgets. No auth, no API key, and unlike xtf's nitter/browser backends it does
+# not depend on a self-hosted service being up, which is what made every
+# account-mode run report all_backends_failed and fall back to a DuckDuckGo
+# search that found 0-3 tweets per account per month.
+SYNDICATION_URL = "https://syndication.twitter.com/srv/timeline-profile/screen-name/{username}"
+SYNDICATION_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+_NEXT_DATA_RE = re.compile(
+    r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', re.S)
+
+
+def _ddg_timelimit() -> str:
+    """DuckDuckGo's coarse time filter closest to (and never shorter than)
+    MAX_PAST_MINUTES. It was pinned to "w" regardless of the configured
+    window, so a 30-day run only ever searched the last 7 days."""
+    days = MAX_PAST_MINUTES / 1440
+    if days <= 1:
+        return "d"
+    if days <= 7:
+        return "w"
+    if days <= 31:
+        return "m"
+    return "y"
 EXTERNAL_URL_RE = re.compile(r"https?://(?!twitter\.com|x\.com)\S+")
 
 
-def load_trusted_accounts(filepath: str = "twtr-accounts.txt") -> list:
+def load_trusted_accounts(filepath: str = os.path.join(SOURCES_DIR, "twtr-accounts.txt")) -> list:
     """Loads trusted account handles from a file or falls back to defaults."""
     default_accounts = ["Reuters", "business", "CNBC", "BBCWorld", "CNN", "AJEnglish"]
     if not os.path.exists(filepath):
@@ -125,7 +170,7 @@ def _ddg_tweet_refs(query: str, label: str, max_results: int, allowed: set = Non
                     query,
                     region="us-en",
                     safesearch="off",
-                    timelimit="w",
+                    timelimit=_ddg_timelimit(),
                     max_results=max_results * 3
                 )
             break
@@ -173,10 +218,48 @@ def discover_tweet_urls(keyword: str, trusted_accounts: list, max_results: int =
     # that X operator, so a 100-handle OR-chain only diluted the query text and
     # returned fewer usable x.com URLs. Scoping is enforced on the results
     # instead, which measurably raises the number of trusted hits per search.
-    refs = _ddg_tweet_refs(f"site:x.com {keyword}", keyword, max_results,
-                           allowed=set(trusted_accounts))
+    # allowed=None: every x.com hit is now a candidate. The trusted list
+    # PRIORITISES (trusted authors are ordered first and kept unconditionally)
+    # instead of filtering at discovery time, because credibility can only be
+    # judged after the tweet is fetched -- follower and engagement counts are
+    # not in a search result. The gate runs in _fetch_and_write_tweets.
+    refs = _ddg_tweet_refs(f"site:x.com {keyword}", keyword, max_results)
+    trusted = {a.casefold() for a in trusted_accounts}
+    refs.sort(key=lambda ref: ref[0].casefold() not in trusted)
     logger.info(f"Found {len(refs)} candidate posts for '{keyword}'.")
     return refs
+
+
+@with_retry(max_attempts=3, base_delay=15.0, exceptions=(Exception,))
+def _syndication_timeline(username: str) -> list:
+    """Returns an account's recent tweets as full tweet dicts, or [].
+
+    One unauthenticated request per account returns 20-100 complete tweet
+    objects -- full_text, created_at, engagement counts and the author's
+    follower count -- so account mode needs no per-tweet fetch at all. The
+    shape is X's own v1.1 tweet JSON, which is what the rest of this scraper
+    already parses.
+    """
+    _fetch_rate_limiter.wait()
+    request = urllib.request.Request(
+        SYNDICATION_URL.format(username=urllib.parse.quote(username)),
+        headers={"User-Agent": SYNDICATION_UA, "Accept": "text/html"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        html = response.read().decode("utf-8", "replace")
+
+    match = _NEXT_DATA_RE.search(html)
+    if not match:
+        return []
+    payload = json.loads(match.group(1))
+    entries = (payload.get("props", {}).get("pageProps", {})
+               .get("timeline", {}).get("entries", []) or [])
+    tweets = []
+    for entry in entries:
+        tweet = (entry.get("content") or {}).get("tweet")
+        if isinstance(tweet, dict) and tweet.get("id_str"):
+            tweets.append(tweet)
+    return tweets
 
 
 @with_retry(max_attempts=3, base_delay=3.0, exceptions=(RateLimited, ConnectionError, TimeoutError))
@@ -190,18 +273,37 @@ def _fetch_timeline_refs(username: str, limit: int) -> list:
 
 def discover_account_tweet_refs(username: str, limit: int = ACCOUNT_MODE_FETCH_LIMIT) -> list:
     """
-    Lists an account's recent tweet IDs (no keyword, no candidate ranking).
+    Returns (refs, prefetched) for one account -- exactly one of them is
+    populated. No keyword, no candidate ranking.
 
-    Preferred path is xtf's own timeline fetch, which is complete and cheap.
-    Its backends (nitter instances, browser driver) go down regularly and
-    independently of DuckDuckGo, though, so a failure there falls back to the
-    same DDG search keyword mode uses, with the keyword left out -- a partial
-    account listing beats losing the account for the whole run.
+    Three sources, tried in order, because losing an account for a whole run
+    is much worse than an extra request:
+
+    1. X's syndication timeline. One unauthenticated request per account
+       returns 20-100 COMPLETE tweet objects, so those need no per-tweet
+       fetch at all. This is the primary path.
+    2. xtf's fetch_timeline. Needs a reachable Nitter instance (XTF_NITTER) or
+       the browser driver; with neither configured it reports
+       all_backends_failed, which is why it is no longer the first choice.
+    3. A path-scoped DuckDuckGo search. Finds only a handful of tweets per
+       account, but a partial listing beats losing the account entirely.
     """
+    try:
+        tweets = _syndication_timeline(username)
+        if tweets:
+            logger.info(f"Found {len(tweets)} tweet(s) for '@{username}' via the syndication timeline.")
+            return [], [(username, str(t["id_str"]), t) for t in tweets]
+        logger.info(f"Syndication timeline for '@{username}' came back empty; trying xtf.")
+    except Exception as e:
+        logger.warning(
+            f"Syndication timeline failed for '@{username}' "
+            f"({type(e).__name__}: {str(e).splitlines()[0]}); trying xtf."
+        )
+
     try:
         refs = _fetch_timeline_refs(username, limit)
         if refs:
-            return refs
+            return refs, None
         logger.info(f"Timeline for '@{username}' came back empty; falling back to DuckDuckGo.")
     except XtfError as e:
         logger.warning(f"Timeline fetch failed for '@{username}' ({e.code}); falling back to DuckDuckGo.")
@@ -210,7 +312,68 @@ def discover_account_tweet_refs(username: str, limit: int = ACCOUNT_MODE_FETCH_L
     # web index actually matches on.
     refs = _ddg_tweet_refs(f"site:x.com/{username}", f"@{username}", limit, allowed={username})
     logger.info(f"Found {len(refs)} candidate posts for '@{username}' via DuckDuckGo.")
-    return refs
+    return refs, None
+
+
+def _tweet_metrics(tw: dict) -> tuple:
+    """Returns (followers, likes, views) for a tweet, 0 where unreported."""
+    author = tw.get("user") if isinstance(tw.get("user"), dict) else {}
+    if not author and isinstance(tw.get("author"), dict):
+        author = tw["author"]
+
+    def as_int(*values):
+        for value in values:
+            try:
+                if value is not None:
+                    return max(0, int(value))
+            except (TypeError, ValueError):
+                continue
+        return 0
+
+    return (
+        as_int(author.get("followers_count"), author.get("followers"), tw.get("followers_count")),
+        as_int(tw.get("favorite_count"), tw.get("likes"), tw.get("like_count")),
+        as_int(tw.get("views"), tw.get("view_count"), _nested_get(tw, "views", "count")),
+    )
+
+
+def _build_engagement(tw: dict) -> dict:
+    """Maps a tweet's counts onto the shared schema.
+
+    Both spellings are accepted: fxtwitter uses likes/replies/retweets, X's
+    syndication JSON uses the v1.1 favorite_count/reply_count/retweet_count.
+    """
+    followers, likes, views = _tweet_metrics(tw)
+    def as_int(*values):
+        for value in values:
+            try:
+                if value is not None:
+                    return max(0, int(value))
+            except (TypeError, ValueError):
+                continue
+        return 0
+    return {
+        "Views": views,
+        "likes": likes,
+        "Comments": as_int(tw.get("replies"), tw.get("reply_count")),
+        "shares": as_int(tw.get("retweets"), tw.get("retweet_count")),
+    }
+
+
+def _is_credible(tw: dict) -> bool:
+    """Whether an untrusted author's post is credible enough to keep.
+
+    Any one bar is enough: a big account, a post with real traction, or a post
+    with real reach. All three at 0 disables the gate and keeps every author.
+    """
+    if not (UNTRUSTED_MIN_FOLLOWERS or UNTRUSTED_MIN_LIKES or UNTRUSTED_MIN_VIEWS):
+        return True
+    followers, likes, views = _tweet_metrics(tw)
+    return (
+        (UNTRUSTED_MIN_FOLLOWERS and followers >= UNTRUSTED_MIN_FOLLOWERS)
+        or (UNTRUSTED_MIN_LIKES and likes >= UNTRUSTED_MIN_LIKES)
+        or (UNTRUSTED_MIN_VIEWS and views >= UNTRUSTED_MIN_VIEWS)
+    )
 
 
 def _extract_media_info(tw: dict, text: str) -> dict:
@@ -249,6 +412,16 @@ def _extract_media_info(tw: dict, text: str) -> dict:
             "media_type": "image",
             "media_url": photo_url
         }
+
+    # 2b. X syndication JSON: attachments live under entities/extended_entities
+    for container in (tw.get("extended_entities"), tw.get("entities")):
+        entity_media = (container or {}).get("media") if isinstance(container, dict) else None
+        if isinstance(entity_media, list) and entity_media:
+            first = entity_media[0] if isinstance(entity_media[0], dict) else {}
+            kind = "video" if first.get("type") in {"video", "animated_gif"} else "image"
+            url = first.get("media_url_https") or first.get("media_url") or first.get("expanded_url")
+            if url:
+                return {"has_media": True, "media_type": kind, "media_url": url}
 
     # 3. External news / article URLs
     urls = tw.get("urls") or tw.get("external_urls") or []
@@ -475,40 +648,56 @@ def _load_existing(master_file: str) -> tuple:
 
 
 def _fetch_and_write_tweets(refs: list, master_file: str, context_terms: list,
-                            lsh, hash_by_id, log_label: str) -> str:
+                            lsh, hash_by_id, log_label: str,
+                            prefetched: list = None, trusted: set = None) -> str:
     """
-    Shared fetch/filter/write core for both keyword mode and account-only
-    mode -- they differ only in how ``refs`` (username, tweet_id) pairs are
-    discovered and what context_terms feed asset detection.
+    Shared fetch/filter/write core for both keyword mode and account-only mode.
+
+    ``refs`` are (username, tweet_id) pairs still needing a per-tweet fetch;
+    ``prefetched`` is a ready list of (username, tweet_id, tweet_dict) for the
+    account-mode syndication path, which already returns full tweet objects.
+    ``trusted`` enables the keyword-mode credibility gate -- when set, an
+    author outside it must clear one of the UNTRUSTED_MIN_* bars.
     """
     cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=MAX_PAST_MINUTES)
     existing_records, existing_ids, existing_timestamps = _load_existing(master_file)
 
-    new_refs = [
-        (username, tweet_id) for username, tweet_id in refs
-        if f"X_{username}_{tweet_id}" not in existing_ids and f"X_{username}_{tweet_id}" not in hash_by_id
-    ]
-    if not new_refs:
-        logger.info(f"All discovered tweets for '{log_label}' have already been gathered.")
-        return master_file
+    if prefetched is None:
+        new_refs = [
+            (username, tweet_id) for username, tweet_id in refs
+            if f"X_{username}_{tweet_id}" not in existing_ids
+        ]
+        if not new_refs:
+            logger.info(f"All discovered tweets for '{log_label}' have already been gathered.")
+            return master_file
 
-    fetched = []
-    with ThreadPoolExecutor(max_workers=FETCH_MAX_WORKERS) as executor:
-        future_to_ref = {executor.submit(_fetch_tweet_safe, u, tid): (u, tid) for u, tid in new_refs}
-        for future in as_completed(future_to_ref):
-            username, tweet_id = future_to_ref[future]
-            try:
-                tw = future.result()
-            except NotFound:
-                continue
-            except Exception as e:
-                logger.warning(f"Giving up on tweet {tweet_id} after retries: {type(e).__name__}: {e}")
-                continue
-            if tw:
-                fetched.append((username, tweet_id, tw))
+        fetched = []
+        with ThreadPoolExecutor(max_workers=FETCH_MAX_WORKERS) as executor:
+            future_to_ref = {executor.submit(_fetch_tweet_safe, u, tid): (u, tid) for u, tid in new_refs}
+            for future in as_completed(future_to_ref):
+                username, tweet_id = future_to_ref[future]
+                try:
+                    tw = future.result()
+                except NotFound:
+                    continue
+                except Exception as e:
+                    logger.warning(f"Giving up on tweet {tweet_id} after retries: {type(e).__name__}: {e}")
+                    continue
+                if tw:
+                    fetched.append((username, tweet_id, tw))
+    else:
+        # Account mode: the syndication endpoint already returned complete
+        # tweet objects, so there is nothing left to fetch per tweet.
+        fetched = [t for t in prefetched if f"X_{t[0]}_{t[1]}" not in existing_ids]
+        if not fetched:
+            logger.info(f"All discovered tweets for '{log_label}' have already been gathered.")
+            return master_file
 
     added_count = 0
     skipped_unsupported_lang = 0
+    skipped_untrusted = 0
+    skipped_out_of_window = 0
+    duplicates_kept = 0
 
     for username, tweet_id, tw in fetched:
         text, text_is_complete, extraction_errors, extraction_reliability = _extract_tweet_text(tw)
@@ -517,29 +706,36 @@ def _fetch_and_write_tweets(refs: list, master_file: str, context_terms: list,
 
         created_dt, created_str = _parse_created_at(tw.get("created_at") or tw.get("timestamp"))
         if created_dt is not None and created_dt < cutoff:
+            skipped_out_of_window += 1
             continue
 
         clean_text = text.replace("\n", " ")
 
         lang, confidence = detect_language(clean_text)
-        if lang not in ALLOWED_LANGUAGES or confidence < LANGUAGE_MIN_CONFIDENCE:
+        if not language_allowed(lang, confidence, ALLOWED_LANGUAGES, LANGUAGE_MIN_CONFIDENCE):
             skipped_unsupported_lang += 1
             continue
 
         author_name, author_id = _extract_author_identity(tw, username)
 
+        if trusted is not None and author_id.casefold() not in trusted and not _is_credible(tw):
+            skipped_untrusted += 1
+            continue
+
         record_id = f"X_{author_id}_{tweet_id}"
         if record_id in existing_ids:
             continue
 
+        # Tagged, not dropped -- the flag rides along on the record so a
+        # downstream stage can still collapse cross-platform repeats.
         duplication_info = dedup_utils.check_and_register(record_id, clean_text, lsh, hash_by_id)
         if duplication_info.get("is_duplicate"):
-            continue
+            duplicates_kept += 1
 
         media_info = _extract_media_info(tw, text)
         collected_at = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         updated_at = _extract_updated_at(tw)
-        translated_text, sentiment, asset_mention = analyze_text(
+        sentiment, asset_mention = analyze_text(
             clean_text, lang, context_terms=context_terms)
 
         record = {
@@ -558,8 +754,7 @@ def _fetch_and_write_tweets(refs: list, master_file: str, context_terms: list,
                 "title": "N/A",
                 "raw_text": clean_text,
                 "Clean_text": "",
-                "language": lang,
-                "translated_text": translated_text
+                "language": lang
             },
             "time_stamps": {
                 "published_at": created_str,
@@ -568,12 +763,7 @@ def _fetch_and_write_tweets(refs: list, master_file: str, context_terms: list,
             },
             "asset_mention": asset_mention,
             "sentiment": sentiment,
-            "Engagement": {
-                "Views": tw.get("views") or tw.get("view_count") or 0,
-                "likes": tw.get("likes") or tw.get("like_count") or 0,
-                "Comments": tw.get("replies") or tw.get("reply_count") or 0,
-                "shares": tw.get("retweets") or tw.get("retweet_count") or 0
-            },
+            "Engagement": _build_engagement(tw),
             "media": media_info,
             "deduplication": duplication_info
         }
@@ -590,6 +780,16 @@ def _fetch_and_write_tweets(refs: list, master_file: str, context_terms: list,
 
     if skipped_unsupported_lang:
         logger.info(f"Filtered out {skipped_unsupported_lang} unsupported-language post(s) for '{log_label}'.")
+    if skipped_untrusted:
+        logger.info(
+            f"Filtered out {skipped_untrusted} post(s) for '{log_label}' from untrusted accounts "
+            f"below the credibility bar ({UNTRUSTED_MIN_FOLLOWERS} followers / "
+            f"{UNTRUSTED_MIN_LIKES} likes / {UNTRUSTED_MIN_VIEWS} views)."
+        )
+    if skipped_out_of_window:
+        logger.info(f"Skipped {skipped_out_of_window} post(s) older than {MAX_PAST_MINUTES} minute(s) for '{log_label}'.")
+    if duplicates_kept:
+        logger.info(f"Kept {duplicates_kept} post(s) flagged as cross-source duplicates for '{log_label}'.")
 
     if added_count > 0:
         with open(master_file, 'w', encoding='utf-8') as f:
@@ -613,7 +813,8 @@ def search_and_scrape_tweets(keyword: str, trusted_accounts: list, lsh, hash_by_
         return None
 
     return _fetch_and_write_tweets(refs, master_file, context_terms=[keyword],
-                                   lsh=lsh, hash_by_id=hash_by_id, log_label=keyword)
+                                   lsh=lsh, hash_by_id=hash_by_id, log_label=keyword,
+                                   trusted={a.casefold() for a in trusted_accounts})
 
 
 def scrape_account_tweets(username: str, lsh, hash_by_id, output_dir: str = "twtr-tweets/"):
@@ -627,17 +828,20 @@ def scrape_account_tweets(username: str, lsh, hash_by_id, output_dir: str = "twt
     safe_username = username.replace(" ", "_").lower()
     master_file = os.path.join(output_dir, f"twitter_{safe_username}.json")
 
-    refs = discover_account_tweet_refs(username, limit=ACCOUNT_MODE_FETCH_LIMIT)
-    if not refs:
+    refs, prefetched = discover_account_tweet_refs(username, limit=ACCOUNT_MODE_FETCH_LIMIT)
+    if not refs and not prefetched:
         logger.info(f"No recent tweets found for '@{username}'.")
         return None
 
+    # trusted=None: account mode collects everything this trusted account
+    # posted in the window, with no credibility gate and no keyword filter.
     return _fetch_and_write_tweets(refs, master_file, context_terms=[],
-                                   lsh=lsh, hash_by_id=hash_by_id, log_label=f"@{username}")
+                                   lsh=lsh, hash_by_id=hash_by_id, log_label=f"@{username}",
+                                   prefetched=prefetched)
 
 
 def main():
-    accounts_file = "twtr-accounts.txt"
+    accounts_file = os.path.join(SOURCES_DIR, "twtr-accounts.txt")
     trusted_accounts = load_trusted_accounts(accounts_file)
     logger.info(f"Loaded {len(trusted_accounts)} trusted accounts from {accounts_file}.")
 
@@ -649,15 +853,20 @@ def main():
     lsh, hash_by_id = dedup_utils.load_lsh()
 
     if mode == "accounts":
-        for account in trusted_accounts:
+        for index, account in enumerate(trusted_accounts, start=1):
             try:
                 scrape_account_tweets(account, lsh, hash_by_id)
             except Exception as e:
                 logger.error(f"Error scraping account '@{account}': {str(e).splitlines()[0]}")
+            # The syndication endpoint is unauthenticated and rate limits a
+            # burst with HTTP 429; pacing keeps the whole list on the good path
+            # instead of dropping most of it to the DuckDuckGo fallback.
+            if index < len(trusted_accounts):
+                time.sleep(random.uniform(*ACCOUNT_DELAY_RANGE))
         logger.info("Scraping for all trusted accounts is done.")
         return
 
-    keyword_file = "twtr-keywords.txt"
+    keyword_file = os.path.join(KEYWORDS_DIR, "twtr-keywords.txt")
     if not os.path.exists(keyword_file):
         logger.error(f"File '{keyword_file}' not found.")
         return
