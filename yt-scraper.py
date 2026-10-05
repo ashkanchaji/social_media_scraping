@@ -67,6 +67,7 @@ def load_trusted_channels(filepath: str = os.path.join(SOURCES_DIR, "yt-channels
     default_channels = ["Reuters", "Bloomberg", "CNBC", "BBC", "CNN", "Al Jazeera"]
     if not os.path.exists(filepath):
         logger.warning(f"'{filepath}' not found. Creating default file.")
+        os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
         with open(filepath, "w", encoding="utf-8") as f:
             f.write("\n".join(default_channels))
         return default_channels

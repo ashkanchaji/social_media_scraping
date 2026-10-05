@@ -10,7 +10,7 @@ This is a single-shot script: it scrapes the window once and exits. Run it
 periodically from cron or a systemd timer rather than looping internally.
 
 Prerequisites:
-  1. pip install -r requirements.txt --break-system-packages
+  1. python -m pip install -r requirements.txt
   2. Create an application at https://my.telegram.org to get api_id/api_hash,
      then put them in .env (loaded automatically by pipeline_utils.py):
        TELEGRAM_API_ID=...
@@ -100,7 +100,7 @@ try:
         MessageMediaWebPage,
     )
 except ImportError:
-    logger.error("telethon is not installed. Run: pip install -r requirements.txt --break-system-packages")
+    logger.error("telethon is not installed. Run: python -m pip install -r requirements.txt")
     exit(1)
 
 

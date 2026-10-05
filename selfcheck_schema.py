@@ -228,6 +228,12 @@ def check_fa_analysis_routing():
 
 
 def main():
+    original_model_name = pipeline_utils._ASSET_NLI_MODEL_NAME
+    try:
+        pipeline_utils._ASSET_NLI_MODEL_NAME = "none"
+        assert pipeline_utils._load_asset_nli_model() is None
+    finally:
+        pipeline_utils._ASSET_NLI_MODEL_NAME = original_model_name
     for platform, fields in PLATFORMS.items():
         record = make_record(platform, *fields)
         quality = build_quality(record)

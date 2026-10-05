@@ -1,7 +1,7 @@
 """
 dedup_utils.py -- shared cross-source duplicate detection.
 
-Used by twtr-scraper.py, yt-scraper.py, and (later) any Telegram scraper so
+Used by all six platform scrapers so
 that the same story covered across platforms gets linked into one
 duplicate_group_id, not just treated as unrelated records.
 
@@ -15,7 +15,7 @@ Backed by SQLite (not a flat JSON file) so it's safe for multiple scraper
 processes to read/write concurrently, e.g. running twtr-scraper.py and
 yt-scraper.py at the same time, or a future 24/7 daemon.
 
-Install: pip install datasketch numpy --break-system-packages
+Install core dependencies with: pip install -r requirements-core.txt
 """
 
 import os

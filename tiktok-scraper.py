@@ -12,7 +12,7 @@ account-driven rather than keyword-driven: every recent video from a trusted
 account is collected and relevance is left to the asset-mapping stage.
 
 Prerequisites:
-  1. pip install -r requirements.txt --break-system-packages
+  1. python -m pip install -r requirements.txt
   2. ffmpeg on PATH (needed by the Whisper fallback's audio postprocessing).
   3. tiktok-accounts.txt with one account username per line.
 """

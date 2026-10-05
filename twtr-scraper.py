@@ -56,7 +56,12 @@ DDGS_MAX_RETRIES = env_int("DDGS_MAX_RETRIES", 3, prefix="X")              # Num
 # and answers a burst with HTTP 429, so a 125-account list needs a real pause
 # between accounts -- without one the run degrades to the low-yield DDG
 # fallback for most of the list.
-ACCOUNT_DELAY_RANGE = env_range("ACCOUNT_DELAY_RANGE", (3.0, 6.0), prefix="X")
+ACCOUNT_DELAY_RANGE = env_range("ACCOUNT_DELAY_RANGE", (38.0, 48.0), prefix="X")
+ACCOUNT_DELAY_BLOCKED_RANGE = env_range("ACCOUNT_DELAY_BLOCKED_RANGE", (2.0, 5.0), prefix="X")
+SYNDICATION_COOLDOWN_SECONDS = env_int("SYNDICATION_COOLDOWN_SECONDS", 600, prefix="X")
+SYNDICATION_RETRY_PASSES = env_int("SYNDICATION_RETRY_PASSES", 2, prefix="X")
+ACCOUNT_MODE_FRESHNESS_MINUTES = env_int("ACCOUNT_MODE_FRESHNESS_MINUTES", 4320, prefix="X")
+_syndication_cooldown_until = 0.0
 
 # Keyword mode used to hard-drop every DuckDuckGo hit whose author was not in
 # twtr-accounts.txt, which threw away ~90% of each search. The trusted list now
@@ -127,6 +132,7 @@ def load_trusted_accounts(filepath: str = os.path.join(SOURCES_DIR, "twtr-accoun
     default_accounts = ["Reuters", "business", "CNBC", "BBCWorld", "CNN", "AJEnglish"]
     if not os.path.exists(filepath):
         logger.warning(f"'{filepath}' not found. Creating default file.")
+        os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
         with open(filepath, "w", encoding="utf-8") as f:
             f.write("\n".join(default_accounts))
         return default_accounts
@@ -230,7 +236,11 @@ def discover_tweet_urls(keyword: str, trusted_accounts: list, max_results: int =
     return refs
 
 
-@with_retry(max_attempts=3, base_delay=15.0, exceptions=(Exception,))
+class _SyndicationBlocked(Exception):
+    """The timeline source is unavailable; use fallbacks and defer a retry."""
+
+
+@with_retry(max_attempts=3, base_delay=15.0, exceptions=(urllib.error.URLError, TimeoutError))
 def _syndication_timeline(username: str) -> list:
     """Returns an account's recent tweets as full tweet dicts, or [].
 
@@ -240,17 +250,26 @@ def _syndication_timeline(username: str) -> list:
     shape is X's own v1.1 tweet JSON, which is what the rest of this scraper
     already parses.
     """
+    global _syndication_cooldown_until
+    if time.monotonic() < _syndication_cooldown_until:
+        raise _SyndicationBlocked("syndication cooldown is active")
     _fetch_rate_limiter.wait()
     request = urllib.request.Request(
         SYNDICATION_URL.format(username=urllib.parse.quote(username)),
         headers={"User-Agent": SYNDICATION_UA, "Accept": "text/html"},
     )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        html = response.read().decode("utf-8", "replace")
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            html = response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            _syndication_cooldown_until = time.monotonic() + SYNDICATION_COOLDOWN_SECONDS
+            raise _SyndicationBlocked("HTTP 429") from e
+        raise
 
     match = _NEXT_DATA_RE.search(html)
     if not match:
-        return []
+        raise _SyndicationBlocked("timeline payload missing")
     payload = json.loads(match.group(1))
     entries = (payload.get("props", {}).get("pageProps", {})
                .get("timeline", {}).get("entries", []) or [])
@@ -271,10 +290,10 @@ def _fetch_timeline_refs(username: str, limit: int) -> list:
     return [(username, tw.tweet_id) for tw in timeline if tw.tweet_id]
 
 
-def discover_account_tweet_refs(username: str, limit: int = ACCOUNT_MODE_FETCH_LIMIT) -> list:
+def discover_account_tweet_refs(username: str, limit: int = ACCOUNT_MODE_FETCH_LIMIT) -> tuple:
     """
-    Returns (refs, prefetched) for one account -- exactly one of them is
-    populated. No keyword, no candidate ranking.
+    Returns (refs, prefetched, syndication_blocked) for one account.
+    Stale syndication results are kept and supplemented by fallback sources.
 
     Three sources, tried in order, because losing an account for a whole run
     is much worse than an extra request:
@@ -288,12 +307,25 @@ def discover_account_tweet_refs(username: str, limit: int = ACCOUNT_MODE_FETCH_L
     3. A path-scoped DuckDuckGo search. Finds only a handful of tweets per
        account, but a partial listing beats losing the account entirely.
     """
+    prefetched = []
+    blocked = False
     try:
         tweets = _syndication_timeline(username)
         if tweets:
             logger.info(f"Found {len(tweets)} tweet(s) for '@{username}' via the syndication timeline.")
-            return [], [(username, str(t["id_str"]), t) for t in tweets]
-        logger.info(f"Syndication timeline for '@{username}' came back empty; trying xtf.")
+            prefetched = [(username, str(t["id_str"]), t) for t in tweets]
+            dates = [_parse_created_at(t.get("created_at") or t.get("timestamp"))[0] for t in tweets]
+            newest = max((date for date in dates if date is not None), default=None)
+            freshness_cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+                minutes=ACCOUNT_MODE_FRESHNESS_MINUTES)
+            if newest is not None and newest >= freshness_cutoff:
+                return [], prefetched, False
+            logger.info(f"Syndication timeline for '@{username}' may be stale; supplementing via xtf.")
+        else:
+            logger.info(f"Syndication timeline for '@{username}' came back empty; trying xtf.")
+    except _SyndicationBlocked as e:
+        blocked = True
+        logger.warning(f"Syndication blocked for '@{username}' ({e}); trying fallback sources.")
     except Exception as e:
         logger.warning(
             f"Syndication timeline failed for '@{username}' "
@@ -303,7 +335,7 @@ def discover_account_tweet_refs(username: str, limit: int = ACCOUNT_MODE_FETCH_L
     try:
         refs = _fetch_timeline_refs(username, limit)
         if refs:
-            return refs, None
+            return refs, prefetched, blocked
         logger.info(f"Timeline for '@{username}' came back empty; falling back to DuckDuckGo.")
     except XtfError as e:
         logger.warning(f"Timeline fetch failed for '@{username}' ({e.code}); falling back to DuckDuckGo.")
@@ -312,7 +344,7 @@ def discover_account_tweet_refs(username: str, limit: int = ACCOUNT_MODE_FETCH_L
     # web index actually matches on.
     refs = _ddg_tweet_refs(f"site:x.com/{username}", f"@{username}", limit, allowed={username})
     logger.info(f"Found {len(refs)} candidate posts for '@{username}' via DuckDuckGo.")
-    return refs, None
+    return refs, prefetched, blocked
 
 
 def _tweet_metrics(tw: dict) -> tuple:
@@ -662,16 +694,13 @@ def _fetch_and_write_tweets(refs: list, master_file: str, context_terms: list,
     cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=MAX_PAST_MINUTES)
     existing_records, existing_ids, existing_timestamps = _load_existing(master_file)
 
-    if prefetched is None:
+    fetched = [t for t in (prefetched or []) if f"X_{t[0]}_{t[1]}" not in existing_ids]
+    prefetched_ids = {str(t[1]) for t in (prefetched or [])}
+    if refs:
         new_refs = [
             (username, tweet_id) for username, tweet_id in refs
-            if f"X_{username}_{tweet_id}" not in existing_ids
+            if f"X_{username}_{tweet_id}" not in existing_ids and str(tweet_id) not in prefetched_ids
         ]
-        if not new_refs:
-            logger.info(f"All discovered tweets for '{log_label}' have already been gathered.")
-            return master_file
-
-        fetched = []
         with ThreadPoolExecutor(max_workers=FETCH_MAX_WORKERS) as executor:
             future_to_ref = {executor.submit(_fetch_tweet_safe, u, tid): (u, tid) for u, tid in new_refs}
             for future in as_completed(future_to_ref):
@@ -685,13 +714,9 @@ def _fetch_and_write_tweets(refs: list, master_file: str, context_terms: list,
                     continue
                 if tw:
                     fetched.append((username, tweet_id, tw))
-    else:
-        # Account mode: the syndication endpoint already returned complete
-        # tweet objects, so there is nothing left to fetch per tweet.
-        fetched = [t for t in prefetched if f"X_{t[0]}_{t[1]}" not in existing_ids]
-        if not fetched:
-            logger.info(f"All discovered tweets for '{log_label}' have already been gathered.")
-            return master_file
+    if not fetched:
+        logger.info(f"All discovered tweets for '{log_label}' have already been gathered.")
+        return master_file
 
     added_count = 0
     skipped_unsupported_lang = 0
@@ -828,16 +853,34 @@ def scrape_account_tweets(username: str, lsh, hash_by_id, output_dir: str = "twt
     safe_username = username.replace(" ", "_").lower()
     master_file = os.path.join(output_dir, f"twitter_{safe_username}.json")
 
-    refs, prefetched = discover_account_tweet_refs(username, limit=ACCOUNT_MODE_FETCH_LIMIT)
+    refs, prefetched, blocked = discover_account_tweet_refs(username, limit=ACCOUNT_MODE_FETCH_LIMIT)
     if not refs and not prefetched:
         logger.info(f"No recent tweets found for '@{username}'.")
-        return None
+        return None, blocked
 
     # trusted=None: account mode collects everything this trusted account
     # posted in the window, with no credibility gate and no keyword filter.
-    return _fetch_and_write_tweets(refs, master_file, context_terms=[],
+    path = _fetch_and_write_tweets(refs, master_file, context_terms=[],
                                    lsh=lsh, hash_by_id=hash_by_id, log_label=f"@{username}",
                                    prefetched=prefetched)
+    return path, blocked
+
+
+def _scrape_account_list(accounts: list, lsh, hash_by_id) -> list:
+    """Keep processing accounts, returning only those needing a source retry."""
+    deferred = []
+    for index, account in enumerate(accounts, start=1):
+        try:
+            _, blocked = scrape_account_tweets(account, lsh, hash_by_id)
+            if blocked:
+                deferred.append(account)
+        except Exception as e:
+            logger.error(f"Error scraping account '@{account}': {str(e).splitlines()[0]}")
+        if index < len(accounts):
+            delay = (ACCOUNT_DELAY_BLOCKED_RANGE if time.monotonic() < _syndication_cooldown_until
+                     else ACCOUNT_DELAY_RANGE)
+            time.sleep(random.uniform(*delay))
+    return deferred
 
 
 def main():
@@ -853,16 +896,16 @@ def main():
     lsh, hash_by_id = dedup_utils.load_lsh()
 
     if mode == "accounts":
-        for index, account in enumerate(trusted_accounts, start=1):
-            try:
-                scrape_account_tweets(account, lsh, hash_by_id)
-            except Exception as e:
-                logger.error(f"Error scraping account '@{account}': {str(e).splitlines()[0]}")
-            # The syndication endpoint is unauthenticated and rate limits a
-            # burst with HTTP 429; pacing keeps the whole list on the good path
-            # instead of dropping most of it to the DuckDuckGo fallback.
-            if index < len(trusted_accounts):
-                time.sleep(random.uniform(*ACCOUNT_DELAY_RANGE))
+        deferred = _scrape_account_list(trusted_accounts, lsh, hash_by_id)
+        for retry_pass in range(SYNDICATION_RETRY_PASSES):
+            if not deferred:
+                break
+            wait = max(0.0, _syndication_cooldown_until - time.monotonic())
+            logger.info(f"Retry pass {retry_pass + 1}: {len(deferred)} account(s), waiting {wait:.1f}s.")
+            time.sleep(wait)
+            deferred = _scrape_account_list(deferred, lsh, hash_by_id)
+        if deferred:
+            logger.warning(f"Syndication still unavailable for {len(deferred)} account(s); fallback results retained.")
         logger.info("Scraping for all trusted accounts is done.")
         return
 

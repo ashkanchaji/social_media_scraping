@@ -22,8 +22,8 @@ x-tweet-fetcher/
 .env
 
 # Monitored keywords and source lists reveal what is being watched.
-keywords/
-sources/
+/keywords/
+/sources/
 
 # Scraper logs (one directory, rotated 5MB x 3 per scraper).
 logs/
@@ -45,3 +45,30 @@ test.py
 .run-scrapers.lock
 logs/run-scrapers.log
 .env.bak.*
+
+# Private configuration and local agent tooling.
+.env.*
+!.env.example
+AGENTS.md
+CLAUDE.md
+.claudeignore
+.codex/
+.agents/
+graphify-out/
+
+# Documentation exports, downloads, and generated artifacts.
+*.pdf
+*.tex
+*.aux
+*.out
+*.log
+*.db
+*.db-wal
+*.db-shm
+*.bak*
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.DS_Store

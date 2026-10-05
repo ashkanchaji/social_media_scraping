@@ -7,7 +7,7 @@ scrapers (dedup, language gate, asset mapping, quality scoring all come from
 the shared modules).
 
 Prerequisites:
-  1. pip install -r requirements.txt --break-system-packages
+  1. python -m pip install -r requirements.txt
   2. Get a client id/secret for the Data API (the classic REST API PRAW
      talks to -- NOT developers.reddit.com/Devvit, which is a separate
      platform for apps that run inside Reddit itself, not for external
@@ -81,7 +81,7 @@ try:
     import praw
     import prawcore
 except ImportError:
-    logger.error("praw is not installed. Run: pip install -r requirements.txt --break-system-packages")
+    logger.error("praw is not installed. Run: python -m pip install -r requirements.txt")
     exit(1)
 
 
@@ -90,6 +90,7 @@ def load_trusted_subreddits(filepath: str = SUBREDDITS_FILE) -> list:
     default_subreddits = ["worldnews", "news", "business", "economics", "investing", "energy"]
     if not os.path.exists(filepath):
         logger.warning(f"'{filepath}' not found. Creating default file.")
+        os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
         with open(filepath, "w", encoding="utf-8") as f:
             f.write("\n".join(default_subreddits))
         return default_subreddits

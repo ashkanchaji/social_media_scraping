@@ -11,7 +11,7 @@ Like tel-scraper.py and tiktok-scraper.py there is no keyword search step:
 discovery is account-driven and relevance is left to the asset-mapping stage.
 
 Prerequisites:
-  1. pip install -r requirements.txt --break-system-packages
+  1. python -m pip install -r requirements.txt
   2. A Truth Social account, put in .env (loaded automatically by
      pipeline_utils.py):
        TRUTHSOCIAL_USERNAME=...

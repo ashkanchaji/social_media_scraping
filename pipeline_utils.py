@@ -6,7 +6,7 @@ and shared social-record schema helpers.
 The schema helpers are intentionally source-agnostic where possible so X,
 YouTube, Telegram, and future social scrapers can emit consistent JSON.
 
-Install: pip install py3langid --break-system-packages
+Install core dependencies with: pip install -r requirements-core.txt
 """
 
 import os
@@ -45,7 +45,7 @@ os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 warnings.filterwarnings("ignore", message=".*sacremoses.*")
 logging.getLogger("telethon").setLevel(logging.ERROR)
 
-_identifier = LanguageIdentifier.from_pickled_model(MODEL_FILE, norm_probs=True)
+_identifier = LanguageIdentifier.from_model_file(MODEL_FILE, norm_probs=True)
 
 
 # ---------------------------------------------------------------------------
@@ -761,6 +761,8 @@ def _load_asset_nli_model():
     null and semantic/context inference is disabled rather than fabricated.
     """
     global _ASSET_NLI_BUNDLE, _ASSET_MODEL_WARNING_EMITTED
+    if _ASSET_NLI_MODEL_NAME.strip().lower() in {"", "none", "off", "disabled"}:
+        return None
     if _ASSET_NLI_BUNDLE is False:
         return None
     if _ASSET_NLI_BUNDLE is not None:
@@ -1625,10 +1627,9 @@ def _record_whisper_env_failure(error_text: str, logger=None) -> bool:
                 f"Whisper failed {_whisper_failure_count} times in a row with an "
                 f"environment/library error ('{error_text}'). Disabling audio "
                 "transcription for the rest of this run and falling back to "
-                "subtitle-only mode. Fix: reinstall a CPU-only ctranslate2 build, "
-                "or run `pip install nvidia-cublas-cu12 nvidia-cudnn-cu12 "
-                "--break-system-packages` and point LD_LIBRARY_PATH at the "
-                "installed nvidia/*/lib directories before the next run."
+                "subtitle-only mode. Fix: use CPU transcription or follow "
+                "faster-whisper's GPU setup for compatible CUDA/cuDNN libraries "
+                "and library paths before the next run (see README.md)."
             )
             return True
     return False
