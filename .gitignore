@@ -72,3 +72,19 @@ dist/
 .pytest_cache/
 .ruff_cache/
 .DS_Store
+# Python build artifacts
+build/
+dist/
+*.egg-info/
+config/.threads.lock
+
+# Local databases, document exports and design review artifacts.
+*.sqlite
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
+*.docx
+*.xlsx
+.impeccable/
+/templaterp.md

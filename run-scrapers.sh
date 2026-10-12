@@ -5,7 +5,7 @@
 #   */10 * * * * /path/to/project/run-scrapers.sh >> /path/to/project/logs/run-scrapers.log 2>&1
 #
 # All configuration (discovery mode, time window, credentials) comes from .env,
-# which pipeline_utils loads on import. Keep MAX_PAST_MINUTES larger than the
+# which src.config.env loads on import. Keep MAX_PAST_MINUTES larger than the
 # cron interval so nothing falls between two runs. Existing record IDs avoid
 # repeated writes; the shared dedup index also identifies cross-source repeats.
 set -u
@@ -20,12 +20,12 @@ PY="$PWD/.venv/bin/python"
 [ -x "$PY" ] || PY=python3
 
 status=0
-for scraper in twtr yt tel reddit tiktok truth; do
-    echo "$(date -Is) === ${scraper}-scraper.py ==="
+for platform in x youtube telegram reddit tiktok truthsocial; do
+    echo "$(date -Is) === ${platform} ==="
     # </dev/null keeps every scraper on its non-interactive path even if cron
     # ever hands it a terminal.
-    if ! "$PY" "${scraper}-scraper.py" </dev/null; then
-        echo "$(date -Is) FAILED: ${scraper}-scraper.py" >&2
+    if ! "$PY" -m engine.runtime --platform "$platform" </dev/null; then
+        echo "$(date -Is) FAILED: ${platform}" >&2
         status=1
     fi
 done

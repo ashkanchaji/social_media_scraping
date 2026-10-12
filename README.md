@@ -1,171 +1,251 @@
-# Social Media Intelligence Pipeline
+# Social Listening VinCons
 
-[![Offline checks](https://github.com/ashkanchaji/social_media_scraping/actions/workflows/ci.yml/badge.svg)](https://github.com/ashkanchaji/social_media_scraping/actions/workflows/ci.yml)
+Tài liệu hiện hành: [bàn giao dev 12/10](docs/development-handoff-20261012.md), [trạng thái code/config](docs/current-state.md), [Dashboard workspace](docs/operations/dashboard-workspace.md) và [đồng bộ đa nền tảng](docs/operations/workspace-platforms-20261012.md).
 
-A Python pipeline that collects financial and energy-market coverage from **six social platforms** and converts it into consistent, analysis-ready JSON records. Shared utilities handle multilingual text, financial asset mentions, sentiment, duplicate detection, and record quality.
+Thu thập nội dung Facebook, tìm kiếm Threads theo dự án và tìm link mạng xã hội qua Google để theo dõi phản ánh liên quan VinCons và VinWonders Vũ Yên. Dự án có giao diện local, acquisition engine, Source Registry, exclusion rules, SQLite lưu nội dung/lineage và lịch crawl hằng ngày riêng từng nền tảng.
 
-The project demonstrates API integration, resilient collection, local NLP inference, audio transcription, and persistent cross-platform deduplication. An offline demo makes the shared pipeline easy to inspect without platform accounts or model downloads.
+Hướng dẫn dành cho workspace Windows `D:\task\social_listening\social_media_scraping`, đồng bộ với code/config ngày **12/10/2026**. Trạng thái và bằng chứng chi tiết: [TODO.MD](TODO.MD). Các báo cáo có ngày là snapshot của lượt kiểm tra đó.
 
-## Try the offline demo
+Dashboard dùng [luồng crawl raw v2](docs/operations/dashboard-raw-v2.md): bài viết → bình luận/phản hồi → lưu raw → OCR ảnh bài → filter từng nội dung → [worker phân loại Gemini](docs/operations/classification-worker.md). Nút crawl và lịch không còn chạy crawler Facebook v1. Kho dữ liệu hỗ trợ loại nội dung, đánh giá/ghi chú và Excel; tab Phản ánh có bộ lọc group, dự án, vấn đề, intent và ngày riêng của từng nội dung. Worker hỗ trợ chế độ nền `--serve`, mặc định poll 15 giây; trạng thái tiến trình xem trên dashboard. Chưa tự khởi động cùng Windows.
 
-Use **Python 3.12 or 3.13**. A GPU is optional.
+Đã hợp nhất vào **một DB hoạt động**: `sessions/acquisition/acquisition.sqlite3`. Raw, phân loại, đánh giá, lịch sử v1 và Google discovery dùng chung file; các bảng có chức năng riêng. File `sessions/conversations-v2.sqlite3` cũ đã bỏ sau backup và kiểm tra integrity/FK. Xem [hợp nhất và crawl 14 ngày](docs/operations/unified-database-backfill.md).
 
-```bash
-git clone https://github.com/ashkanchaji/social_media_scraping.git
-cd social_media_scraping
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements-core.txt
-python demo.py
+Phạm vi lựa chọn gồm **VinCons (tổ chức)** và **VinWonders Vũ Yên**. Chọn phạm vi trong lịch để giới hạn group; lựa chọn trống chạy tất cả group đang bật (hiện 14 group). Group chỉ là ngữ cảnh, không chứng minh nội dung phản ánh thuộc dự án. Pilot raw v2 thật ngày 09/10 đã lưu 6 bình luận; chưa xác nhận coverage toàn group hoặc đầy đủ replies.
+
+## 1. Chạy nhanh trên máy hiện tại
+
+Mở PowerShell, dùng venv `.venv\audit` đã cài sẵn:
+
+```powershell
+Set-Location 'D:\task\social_listening\social_media_scraping'
+.\.venv\audit\Scripts\python.exe -X utf8 -m engine.acquisition_cli validate
+.\.venv\audit\Scripts\python.exe -X utf8 -m engine.dashboard
 ```
 
-On Windows, activate with `.venv\Scripts\Activate.ps1` in PowerShell.
+Mở **[http://127.0.0.1:8765](http://127.0.0.1:8765)**. Giữ cửa sổ PowerShell chạy; `Ctrl+C` dừng backend. Không cần activate venv khi dùng đường dẫn Python như trên.
 
-The demo processes three **synthetic** posts through the real shared utilities:
+Chỉ chạy **một backend** cho cùng database/profile. Nếu giao diện đang mở được, dùng server hiện tại. Sau khi cập nhật code, khởi động lại backend rồi nhấn `Ctrl+F5` trên trình duyệt.
 
-- An English X post and an identical Telegram post, linked by their duplicate group.
-- A Persian Telegram post with `USDT` and gold (`XAU`) mentions.
-- Chronological JSON output with source metadata, language, asset mentions, duplicate flags, and quality checks.
+## 2. Chức năng hiện có
 
-It prints JSON to stdout, uses a temporary SQLite database, and cleans up its temporary files. Sentiment and NLI models are explicitly disabled; their confidence fields remain `null`. Synthetic URLs illustrate the schema and do not identify fetched posts.
+| Chức năng | Cách lấy dữ liệu | Phạm vi hiện tại |
+| --- | --- | --- |
+| Facebook group | Raw v2 + Playwright/Chromium, profile Facebook riêng | 14 group VERIFIED/enabled, 7 VinCons + 7 Vũ Yên; chưa xác nhận coverage đầy đủ |
+| Tìm kiếm Google | Engine + **SerpApi API**, keyword/hashtag | Tìm link Facebook/TikTok/YouTube; nguồn mới vào discovery queue |
+| Thu thập Threads | **Playwright + Chrome**, query theo dự án | POST/REPLY, kho chung, lịch nhiều dự án; LIVE_PARTIAL |
+| TikTok keyword/hashtag | Adapter browser riêng | Có runtime/offline tests; chưa đạt live acceptance, chưa có tab TikTok trực tiếp |
+| Lịch Facebook | Scheduler trong tiến trình dashboard | Hai khung hằng ngày, tránh chạy chồng, lưu lịch để khôi phục |
+| Collector legacy | Runtime riêng của sáu nền tảng | [Tài liệu legacy](docs/legacy-collectors.md), schema/cấu hình riêng |
 
-## Supported collectors
+Dashboard raw v2 đã thu POST/COMMENT/REPLY, OCR ảnh bài, nối classifier và xuất Excel theo phiên kết quả. Acquisition CLI v1/Google discovery vẫn không tự chạy comments, ASR hoặc LLM. Export workspace chưa thay exporter bốn sheets theo PRD v1. Không suy dự án/vị trí hoặc vấn đề từ tên group hay Google snippet.
 
-| Platform | Collection method | Configuration / credentials | Output directory |
-|---|---|---|---|
-| X / Twitter | Public syndication timelines; `x-tweet-fetcher` and DuckDuckGo fallbacks | Accounts or keywords; optional `XTF_NITTER` for timeline fallback | `twtr-tweets/` |
-| YouTube | `yt-dlp` discovery, captions, optional local Whisper fallback | Channels or keywords | `yt-transcripts/` |
-| Telegram | Telethon channel history, including refresh of edited messages | Public channels; `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, initial user login | `tel-transcripts/` |
-| Reddit | Read-only PRAW Data API | Subreddits; `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET` | `reddit-posts/` |
-| TikTok | Account video listings, captions, optional Whisper fallback | Verified account usernames | `tiktok-videos/` |
-| Truth Social | Mastodon-compatible account/status endpoints | Accounts; username/password or `TRUTHSOCIAL_TOKEN` | `truth-posts/` |
+## 3. Cài đặt trên môi trường mới
 
-`SCRAPE_MODE=accounts` reads configured sources within the collection window. `SCRAPE_MODE=keyword` uses keyword discovery or filtering. Telegram always reads channel history. TikTok and Truth Social keyword mode filters configured accounts' timelines. X keyword mode prioritizes trusted accounts and applies configurable credibility thresholds to other authors.
+Dùng Python **3.12 hoặc 3.13**; workspace hiện tại dùng 3.13.13. Facebook/Google acquisition không cần GPU hoặc model NLP.
 
-## Architecture
+### Tạo venv và cài dependency
 
-```mermaid
-flowchart LR
-    Config[Environment + source lists] --> Collect[Six platform collectors]
-    Collect --> Text[Fetch text / captions / audio]
-    Text --> Filter[Time window + language gate]
-    Filter --> Dedup[Exact hash + MinHash LSH]
-    Dedup <--> SQLite[(Shared SQLite index)]
-    Dedup --> NLP[Sentiment + asset mentions]
-    NLP --> Quality[Schema + extraction quality]
-    Quality --> JSON[Chronological JSON files]
+```powershell
+Set-Location 'D:\task\social_listening\social_media_scraping'
+py -3.13 -m venv .venv\audit
+.\.venv\audit\Scripts\python.exe -m pip install -r requirements-acquisition.txt
+.\.venv\audit\Scripts\python.exe -m pip install --no-deps -e .
+$env:PLAYWRIGHT_BROWSERS_PATH = Join-Path (Get-Location) '.venv\playwright-browsers'
+.\.venv\audit\Scripts\python.exe -m playwright install chromium
 ```
 
-**Shared infrastructure:** rotating logs, retry/backoff, rate limiting, environment parsing, and incremental file merges. X account collection distinguishes blocked requests from empty timelines, falls back immediately during cooldowns, and retries deferred accounts after the initial pass.
+Chỉ tạo venv nếu chưa có. `requirements-acquisition.txt` bao gồm core và browser requirements. Nếu chưa có Python 3.13, dùng bản Python 3.12/3.13 có sẵn thay cho `py -3.13`.
 
-**Text analysis:** English sentiment uses FinBERT; other languages use a multilingual model. Asset tagging combines aliases/cashtags with optional NLI relevance scoring. Non-Latin text uses direct aliases without English NLI inference. Missing models produce `null` confidence rather than invented predictions.
+**Venv hiện tại được tạo bằng uv, không có module pip.** Khi cần cài lại dependency trong venv này:
 
-**Deduplication:** Unicode-aware normalization and MD5 identify identical text; MinHash/LSH compares four-word shingles at a Jaccard threshold of `0.55`. SQLite persists the index between runs. X, Telegram, TikTok, and Truth Social retain duplicate flags; YouTube and Reddit currently skip records marked as duplicates. Similar text does not necessarily mean the same event.
-
-**Quality:** platform-aware identity, URL, timestamp, extraction, engagement/media, asset, sentiment, and dedup checks contribute to a harmonic-mean score from 0–100. This score measures structural quality, not factual accuracy or model performance.
-
-## Run live collection
-
-Install collector dependencies from the repository root:
-
-```bash
-python -m pip install -r requirements.txt
-cp .env.example .env
-mkdir -p keywords sources
-cp -n examples/keywords/*.txt keywords/
-cp -n examples/sources/*.txt sources/
+```powershell
+uv pip install --python .\.venv\audit\Scripts\python.exe -r requirements-acquisition.txt
+uv pip install --python .\.venv\audit\Scripts\python.exe --no-deps -e .
 ```
 
-These copy commands target Linux/macOS. On Windows, copy the example folders using your file manager. Edit `.env` and the copied inputs before collecting. Telegram, TikTok, and Truth Social source templates deliberately contain no usernames: add verified sources yourself. The examples are starter configuration, separate from private monitoring lists.
+YouTube bridge/collector legacy cần thêm dependency từ `requirements.txt`:
 
-Set credentials only in `.env` or your environment. Telegram's first run requires interactive phone/code login; later runs reuse the local session. Complete that login before using the unattended runner.
-
-Run an individual collector:
-
-```bash
-X_SCRAPE_MODE=accounts python twtr-scraper.py
-YT_SCRAPE_MODE=keyword python yt-scraper.py
-python tel-scraper.py
-python reddit-scraper.py
-python tiktok-scraper.py
-python truth-scraper.py
+```powershell
+uv pip install --python .\.venv\audit\Scripts\python.exe -r requirements.txt
 ```
 
-Environment prefixes are `X_`, `YT_`, `TEL_`, `RD_`, `TT_`, and `TS_`. A prefixed setting overrides its shared setting. Shell exports override `.env` for the **same variable name**. The example `.env` includes X/YouTube mode overrides; change those when switching modes.
+NLP/Whisper là phần tùy chọn trong `requirements-models.txt`; FFmpeg/models có hướng dẫn ở [legacy collectors](docs/legacy-collectors.md). Không cần cài phần này chỉ để crawl Facebook. OCR ảnh bài cần thêm `requirements-ocr.txt` và binary/traineddata Tesseract theo [runbook OCR](docs/operations/facebook-image-ocr.md).
 
-Key settings are documented in [`.env.example`](.env.example):
+### Cấu hình môi trường
 
-| Setting | Purpose |
-|---|---|
-| `SCRAPE_MODE` | `keyword` or `accounts` |
-| `MAX_PAST_MINUTES` | Collection window in minutes; `1440` means one day |
-| `ALLOWED_LANGUAGES` | Comma-separated language codes; default `en,fa` |
-| `LANGUAGE_MIN_CONFIDENCE` | Reject unsupported languages only when detection is confident |
-| `SENTIMENT_MODEL` / `MULTILINGUAL_SENTIMENT_MODEL` | Language-specific sentiment models; `none` disables them |
-| `ASSET_NLI_MODEL` | Three-class relevance model; `none` keeps direct aliases only |
-| `WHISPER_TASK` | `translate` for English audio output or `transcribe` to retain the spoken language |
+Tạo `.env` từ template nếu chưa có, giữ nguyên file hiện hữu:
 
-### Optional NLP and transcription
-
-```bash
-python -m pip install -r requirements-models.txt
+```powershell
+if (-not (Test-Path -LiteralPath '.env')) {
+    Copy-Item -LiteralPath '.env.example' -Destination '.env'
+}
 ```
 
-Install **FFmpeg** on your system for audio fallback and make `ffmpeg` available on `PATH`. Model weights download on first use and can require substantial disk space and RAM. CPU inference is supported; compatible CUDA/cuDNN libraries are needed for GPU Whisper. Follow [faster-whisper's GPU setup](https://github.com/SYSTRAN/faster-whisper#gpu) for your machine.
+Đặt key trong `.env` nếu dùng tab Google:
 
-Without the optional dependencies, collection can still use platform text/captions and direct asset aliases. Sentiment is `null`; semantic asset inference and Whisper audio fallback are unavailable. YouTube may translate non-English captions to English. Whisper defaults to `translate`; set `WHISPER_TASK=transcribe` to preserve spoken language. Sentiment analysis itself does not translate stored text.
+```dotenv
+SERPAPI_API_KEY=your_local_key
+```
 
-### Unattended runs
+Facebook crawl/lịch không cần SerpApi key. Worker phân loại cần `GEMINI_API_KEY`, `GEMINI_API_BASE_URL`, `GEMINI_MODEL` trong `.env`/environment; OCR local không cần key. `.env`, `sessions/`, database và runtime reports được ignore; không đưa key/cookies/session vào source config hoặc Git. Biến môi trường của tiến trình có thể ghi đè `.env`; sau khi thay key, kiểm tra nguồn cấu hình và khởi động lại backend.
 
-On Linux, `bash run-scrapers.sh` runs all six collectors sequentially using `.venv/bin/python` when available. `flock` prevents overlapping runner instances. The runner continues after process failures and exits nonzero if any collector process fails; collectors can also log configuration/source errors and return normally, so inspect `logs/`.
+## 4. Chuẩn bị phiên Facebook
 
-For cron, use an absolute project path, create `logs/` before redirecting output, and keep the collection window larger than the schedule interval. Run duration depends on source count, pacing, models, and upstream limits.
+Mở Chromium riêng của dự án để đăng nhập thủ công:
 
-## Record format
+```powershell
+.\.venv\audit\Scripts\python.exe -X utf8 -m engine.browser_session --platform facebook --login
+```
 
-Each output file contains a JSON array sorted by publication time. Field capitalization is intentional and shared across collectors.
+Đăng nhập, kiểm tra vào được group, **đóng browser và chờ lệnh kết thúc** trước khi crawl. Phiên lưu tại `sessions/browser/facebook/`, được tái sử dụng ở các lượt sau. Login command mở lại trang Facebook đầu tiên không đồng nghĩa bị đăng xuất.
 
-| Field | Contents |
-|---|---|
-| `record_id` | `<Platform>_<author_or_channel_id>_<native_id>` |
-| `Source` | Platform, source/author identity, original URL |
-| `Content` | Type, title, `raw_text`, empty downstream `Clean_text`, detected language |
-| `time_stamps` | UTC `published_at`, `collected_at`, optional `updated_at` |
-| `asset_mention` | Mention text, canonical asset, symbol, class, ID, optional confidence |
-| `sentiment` | `positive`, `neutral`, or `negative` plus confidence; nullable |
-| `Engagement` / `media` | Available interaction counts and attachment metadata |
-| `deduplication` | Content hash, duplicate flag, group and original record IDs |
-| `quality` | Completeness, failed checks, extraction errors, score |
+Không mở login command khi job Facebook đang giữ profile. Nếu gặp login/CAPTCHA/access denied, xử lý thủ công rồi chạy lại; adapter không bypass. Chưa kiểm chứng anonymous access cho toàn bộ group, nên cấu hình hiện tại dùng phiên đã đăng nhập.
 
-Inspect the full format with `python demo.py`. Extend the built-in asset registry by copying [the registry template](assets-registry/asset-registry.example.json) to `assets-registry/asset-registry.json` and editing its entries.
+Smoke test sau chỉ kiểm tra Chromium trên trang local, không chứng minh truy cập Facebook:
 
-## Repository layout
+```powershell
+.\.venv\audit\Scripts\python.exe -m engine.browser_session --platform facebook --smoke
+```
+
+Chi tiết: [browser bootstrap](docs/operations/browser-bootstrap.md), [runbook acquisition](docs/operations/acquisition-runbook.md).
+
+## 5. Sử dụng giao diện
+
+Giao diện mở ở **Phản ánh**. Bốn tab là **Phản ánh / Kho dữ liệu / Thu thập / Tìm link Google**. Hướng dẫn và giới hạn nghiệm thu: [Dashboard workspace](docs/operations/dashboard-workspace.md).
+
+- **Phản ánh:** chọn bộ lọc, bấm **Áp dụng bộ lọc**; có lựa chọn nhanh Giữ / Cần xem xét / Loại / Chưa phân loại. Mở một nội dung để đọc bài gốc, bình luận/trả lời và lưu đánh giá riêng với model. Nút xử lý hàng chờ chạy một lượt tối đa 10 nội dung **toàn hệ thống**, không giới hạn theo bộ lọc bảng.
+- **Kho dữ liệu:** raw được lưu trước khi filter/classify, có POST/COMMENT/REPLY, kể cả nội dung bị loại. Bộ lọc theo ngày đăng riêng của node, có lần thu trong khoảng hoặc lần thu mới nhất; ngày hiển thị theo giờ Việt Nam. Không suy bài thuộc window khi chưa xác minh thời gian.
+- **Đánh giá / ghi chú:** có nháp theo nội dung trên máy, danh sách mở lại nháp, kiểm tra xung đột giữa các phiên và đánh giá hàng loạt tối đa 100 mục. Lưu rồi **Làm mới dữ liệu** để nhận đánh giá mới vào phiên bảng.
+- **Xuất Excel:** xuất mọi trang của đúng phiên kết quả đã áp dụng, giữ số dòng/thứ tự/thời điểm chốt. Không đưa bộ lọc chưa áp dụng hoặc nháp vào Excel. Tách kết quả model, đánh giá, ghi chú, nguồn và metadata; có sheet Phạm vi.
+- **Thu thập:** Chạy ngay / Lịch hằng ngày / Lịch sử / Nguồn theo dõi. Dùng Playwright và phiên Facebook; không dùng SerpApi. Đổi input không thay đổi phạm vi kết quả lượt đã chạy.
+- **Tìm link Google:** keyword/hashtag gợi ý hoặc tự nhập, tối đa ba giá trị mỗi nhóm, mặc định hôm nay; dùng SerpApi. Nguồn mới phải qua duyệt, search không chứng minh đã thu mọi bài trong ngày.
+
+Desktop dùng bảng; mobile mặc định danh sách, có bộ lọc thu gọn và chi tiết toàn màn hình. Bảng giữ phiên trong lúc đọc; kiểm tra dữ liệu mới chỉ thông báo, không xóa editor/nháp đang dùng. Bộ lọc và xem dữ liệu không gọi crawler hoặc model.
+
+## 6. Lịch crawl hằng ngày
+
+Trong tab **Thu thập**, mục **Lịch hằng ngày** có hai khung giờ và chu kỳ. Lịch raw v2 đã lưu trên workspace, đọc lại ngày 11/10/2026:
+
+| Khung giờ Việt Nam | Mốc chạy với chu kỳ 45 phút |
+| --- | --- |
+| 05:00–08:30 | 05:00:01, 05:45, 06:30, 07:15, 08:00, **08:30 (chốt)** |
+| 17:00–18:30 | 17:00:01, 17:45, **18:30 (chốt)** |
+
+- **Bật / cập nhật lịch** lưu khung/chu kỳ; **Tắt lịch** ngăn lượt tiếp theo, lượt đang chạy được hoàn tất.
+- Lặp mỗi ngày, ngoài khung không bắt đầu lượt mới. Backend mở lại ngoài khung chờ khung tiếp theo, không replay lượt bỏ lỡ.
+- Mỗi job lấy bài từ đầu khung đến thời điểm chạy theo `[start,end)`; lưu UTC, hiển thị giờ Việt Nam. Window không mở rộng khi browser chạy lâu.
+- Lịch v2 thêm lượt chốt cuối khung, kể cả 08:30 không nằm trên grid 45 phút. Mốc mở chờ 1 giây để window không rỗng.
+- Crawl dashboard giới hạn **100 candidate inventory/group, 20 thread/group, tối đa 120 giây/group, 1.200 giây/run**; budget nguồn được chia theo thời gian còn lại, chưa đảm bảo thu hết feed/comments/replies.
+
+**Giữ máy và backend chạy để lịch hoạt động.** Scheduler này chưa phải Windows service và không đánh thức máy sleep. Chỉ chạy một backend cho cùng database/profile. Lịch lưu ở `sessions/acquisition/dashboard-schedule.json`; xem trạng thái thực tế trên UI hoặc:
+
+```powershell
+Invoke-RestMethod -Uri 'http://127.0.0.1:8765/api/schedule'
+```
+
+Chi tiết và giới hạn: [dashboard schedule](docs/operations/dashboard-crawl-schedule.md).
+
+## 7. Rule loại nội dung
+
+Rule `NO_SALES_RECRUITMENT_BUY_SELL_EXCHANGE` loại intent rõ ràng: **tuyển dụng, bán hàng, mua bán, bất động sản, thuê, vay nợ và trao đổi hàng hóa**.
+
+**Dashboard raw v2** lưu raw trước filter/classify, kể cả DROP. Intent bài cha không loại comments/replies; OCR ảnh bài có evidence riêng. **Acquisition v1/Google routing** áp dụng rule trước deep fetch, kiểm tra lại sau fetch và trước reuse/output; clear DROP chỉ giữ bảy trường rejection audit, không lưu raw. Complaint, cảnh báo lừa đảo, nợ lương, trao đổi ca làm hoặc intent mơ hồ giữ REVIEW. Tên group chứa “tuyển dụng” không loại toàn bộ nguồn. PASS/REVIEW không phải kết luận relevance nghiệp vụ.
+
+Đây là heuristics, có thể bỏ sót cách diễn đạt mới; không tuyên bố nhận hết mọi bài tuyển dụng. Cấu hình: [exclusions.yaml](config/exclusions.yaml); implementation: [prefilter.py](src/acquisition/prefilter.py).
+
+## 8. Chạy CLI và xuất dữ liệu
+
+Kiểm tra cấu hình/nguồn, không crawl:
+
+```powershell
+.\.venv\audit\Scripts\python.exe -m engine.acquisition_cli validate
+.\.venv\audit\Scripts\python.exe -m engine.acquisition_cli sources list
+```
+
+Ví dụ raw v2 quét một thread đã duyệt trong **09/10/2026 05:00–08:30 VN**, với UTC tương ứng; post cha có thể cũ hơn window:
+
+```powershell
+.\.venv\audit\Scripts\python.exe -X utf8 -m engine.conversation_cli --db sessions/acquisition/acquisition.sqlite3 scan-thread --source-id fb_group_139108668844789 --post-url 'https://www.facebook.com/groups/139108668844789/posts/987006180721696' --start '2026-10-08T22:00:00Z' --end '2026-10-09T01:30:00Z' --seconds 120
+```
+
+Lệnh trên lưu raw v2, không tự gọi Gemini nếu không thêm `--classify`. Không chứng minh đủ coverage của thread/window. Tắt lịch trước khi vận hành browser thủ công nếu lịch có thể đến hạn. `acquisition_cli run` vẫn là CLI **v1/post-only**; truyền `--source-id` để giới hạn provider, vì bỏ tùy chọn này có thể chạy cả Google và tiêu thụ API quota.
+
+Xuất **toàn bộ acquisition v1 records/observations hiện lưu**, không giới hạn riêng run hay khoảng ngày; đây không phải export raw conversation/classification v2. Xuất Excel v2 từ phiên kết quả đã áp dụng trên dashboard:
+
+```powershell
+New-Item -ItemType Directory -Force -Path reports | Out-Null
+.\.venv\audit\Scripts\python.exe -m engine.acquisition_cli export --output reports\acquisition-export.json
+```
+
+Lệnh probe/verify/enable/disable nguồn, duyệt queue và dispatch: [runbook acquisition](docs/operations/acquisition-runbook.md). `social-acquire` là entry point tương đương sau khi cài package; xem `--help`.
+
+## 9. Cấu trúc và dữ liệu
 
 ```text
-*-scraper.py                    Six independent platform collectors
-pipeline_utils.py               Configuration, analysis, scoring, output helpers
-dedup_utils.py                  Persistent exact/near-duplicate detection
-demo.py                         Offline synthetic pipeline demo
-selfcheck_schema.py             Schema, config, Unicode, and routing checks
-selfcheck_twtr_retry.py          Mocked X blocking/fallback/retry checks
-run-scrapers.sh                 Sequential Linux runner with overlap lock
-requirements*.txt               Core, collection, and optional model dependencies
-examples/                       Public starter keywords and source templates
-assets-registry/                Custom asset registry template
-.github/workflows/ci.yml         Offline checks on Python 3.12 and 3.13
+engine/                       Điều phối, CLI, Registry, dashboard và scheduler
+src/acquisition/              Adapter, browser, identity, models và prefilter
+src/storage/                  SQLite acquisition/raw v2, revisions, evidence, observations
+src/analysis/                 Taxonomy, classification contract, gateway và intent
+src/media/                    OCR và media helpers
+src/collectors/               Sáu collector legacy
+config/                       Sources, watchlists, projects, acquisition, taxonomy runtime
+specs/                        Feature specs, contracts, traceability PRD
+tests/                        Contract, integration, architecture checks
+docs/                         Runbooks, thiết kế và bằng chứng
+sessions/browser/facebook/    Profile Facebook local
+sessions/browser/tiktok/      Profile TikTok local
+sessions/acquisition/         acquisition.sqlite3 và dashboard-schedule.json
+reports/                      Export, report, preview local (gitignored)
 ```
 
-Private `.env` files, actual source/keyword lists, login sessions, collected records, logs, databases, PDF documentation, vendored dependencies, and local Graphify artifacts are excluded from version control.
+Dependency đi từ `engine` đến `src`; acquisition không thay schema/output legacy. Identity dùng platform + native ID, fallback URL chuẩn hóa; nhiều lần phát hiện lưu thành observations. Nội dung rỗng không được dùng để gộp bài khác nhau. Database/profile được giữ qua các lần chạy; không xóa để “reset” nếu cần giữ dữ liệu và phiên đăng nhập.
 
-## Validation and limits
+## 10. Kiểm tra và xử lý lỗi
 
-```bash
-python selfcheck_schema.py
-python selfcheck_twtr_retry.py
-python demo.py
-bash -n run-scrapers.sh
+Chạy suites offline theo CI (browser fixtures opt-in mặc định skip):
+
+```powershell
+.\.venv\audit\Scripts\python.exe -X utf8 -m unittest discover -s tests -q
 ```
 
-CI runs these offline checks plus Python compilation. The checks validate shared behavior and mocked X failures; they do not establish live platform availability, transcription accuracy, or NLP accuracy.
+Browser fixtures là nhóm opt-in qua `ACQUISITION_BROWSER_TESTS=1`. Offline tests không chứng minh live coverage, model accuracy hoặc scheduler đã ổn định nhiều ngày.
 
-Live coverage depends on platform permissions, source visibility, time windows, caps, search indexing, and rate limits. X syndication can be cached or incomplete; fallback discovery cannot guarantee full account history. Unofficial web endpoints can change. Configure conservative pacing, respect each platform's access requirements, and review collected text before downstream analysis.
+| Hiện tượng | Cách xử lý |
+| --- | --- |
+| Không mở được localhost | Kiểm tra terminal/dashboard và đúng cổng; đọc lỗi bind trước khi mở thêm server |
+| Chưa thấy UI mới | Restart backend sau cập nhật code, rồi `Ctrl+F5` |
+| `No module named pip` | Venv hiện tại dùng `uv pip install --python ...` ở mục 3 |
+| Chromium executable thiếu | Cài Chromium vào đúng `PLAYWRIGHT_BROWSERS_PATH` như mục 3 |
+| Profile đang được sử dụng | Đóng login browser/job giữ profile; không xóa profile hoặc mở đồng thời |
+| Facebook login/CAPTCHA | Tắt lịch nếu cần, xác minh thủ công, đóng browser rồi chạy lại |
+| Google key/quota lỗi | Kiểm tra `.env`/process environment và quota provider; Facebook không phụ thuộc key này |
+| Không có kết quả | Đối chiếu ngày, exclusion, source enabled và outcome; không đồng nghĩa group không có bài |
+| Lịch không chạy | Kiểm tra enabled/next_run, giờ Việt Nam, máy sleep, backend đã dừng hoặc service bận |
+
+Tham khảo: [chỉ mục tài liệu](docs/README.md), [config](config/README.md), [specs](specs/README.md), [TODO](TODO.MD), [refactor lịch sử](docs/refactor-summary.md), [legacy collectors](docs/legacy-collectors.md). Report trong `reports/` là artifact của workspace local, không được cam kết có trong checkout mới.
+
+## Duyệt phản ánh
+
+Tab **Phản ánh** có các bộ lọc chính: từ khóa, dự án theo dõi, group, nhóm vấn đề, kết quả và khoảng ngày. Bảng tách riêng taxonomy, ý định, kết quả phân loại và trạng thái xử lý; bộ lọc kỹ thuật OCR/chất lượng nằm trong **Kho dữ liệu**. Xem [ánh xạ bộ lọc với backend và hướng dẫn sử dụng](docs/operations/reflections-workspace.md). Sau khi cập nhật giao diện, tải lại trang và bấm **Làm mới dữ liệu** để tạo phiên kết quả mới.
+
+## Thu thập Threads
+
+Threads đã triển khai tìm kiếm theo truy vấn dự án bằng **Playwright + Chrome**, thu bài viết/trả lời, lưu raw vào kho chung trước filter/classify và dùng Gemini theo batch. Trong tab **Thu thập**, chọn Facebook hoặc Threads; nguồn/query, lượt chạy và lịch độc lập. Kho dữ liệu/Phản ánh có bộ lọc nền tảng, nguồn/truy vấn và export Excel.
+
+**Giao diện 12/10:** trạng thái đầu trang và nguồn/chi tiết ghi rõ Facebook/Threads. **Thu thập → Threads → Lịch hằng ngày** chọn nhiều dự án; hiện đã lưu VinCons và VinWonders Vũ Yên, hai ca 05:00–08:30 và 17:00–18:30, 45 phút. **Nguồn theo dõi** cho biết số nội dung/lượt gần nhất từng truy vấn; Snapshot mới đã có dữ liệu qua truy vấn VinCons; chưa nghiệm thu tính liên quan/coverage. [Kiểm chứng](docs/operations/workspace-platforms-20261012.md).
+
+Pilot thật theo `VinWonders Vũ Yên` đã lưu 43 nội dung (4 bài viết, 39 trả lời), trạng thái **LIVE_PARTIAL**: chưa chứng minh thu hết khoảng thời gian hoặc toàn bộ trả lời lồng nhau. Xem [hướng dẫn chạy và bằng chứng](docs/operations/threads-acquisition.md), [TODO](TODO.MD), [plan P0–P7](docs/implementation-plan-threads.md). Provider API và OCR Threads chưa nghiệm thu. Tên `RAW_V2_THREADS` vẫn chỉ chế độ hội thoại Facebook cũ.
+
+## Đọc chữ trong ảnh Facebook
+
+Dashboard tách cột **Nguồn** và **Nội dung**, đồng thời phân biệt thiếu văn bản/OCR, đang chờ và kết quả cần phân loại lại. Có thể chuẩn bị hàng chờ mà không gọi model bằng `python -m engine.classification_worker --prepare-only`; xem [kiểm tra hàng chờ và các nội dung chưa phân loại](docs/operations/classification-miss-audit-20261010.md).
+
+Từ 11/10/2026, classifier dùng model cấu hình `ag/gemini-3.8-flash-low`; worker nền kiểm tra hàng chờ mỗi 15 giây. Đổi model mặc định giữ các kết quả đã được chấp nhận nếu đầu vào và taxonomy/prompt/rule còn khớp, đồng thời giữ model gốc trong lịch sử. [Triển khai và kiểm chứng chuyển model](docs/operations/classification-worker.md#chuyển-model-và-giữ-kết-quả--11102026).
+
+Crawler đã nối OCR ảnh đính kèm bài vào kho raw v2. Caption và chữ trong ảnh được lưu riêng; classifier nhận evidence OCR có nguồn gốc và chất lượng. Chưa OCR ảnh bình luận/phản hồi hoặc video. Chi tiết nội dung có **Chữ trong ảnh**, bộ lọc OCR và export Excel sheet evidence.
+
+```powershell
+.\.venv\audit\Scripts\python.exe -X utf8 -m engine.image_ocr_cli --probe
+```
+
+Hướng dẫn cài engine, thu lại ảnh từng bài và giới hạn pilot tại [runbook OCR](docs/operations/facebook-image-ocr.md). Pilot Facebook thật đã đọc ảnh; phân loại live chỉ đạt khi Gemini trả kết quả qua validation, không tính HTTP 503 là thành công.
